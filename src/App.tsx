@@ -20,6 +20,7 @@ import { LoginView, PendingAccessView } from './components/LoginView';
 import { RecebimentoModule } from './components/RecebimentoModule';
 import { P2PProvider, useP2P } from './context/P2PContext';
 import { NavModule, ROLE_LABELS } from './types/p2p';
+
 const DASHBOARD_ENABLED = false;
 
 const NAV_ITEMS: Array<{
