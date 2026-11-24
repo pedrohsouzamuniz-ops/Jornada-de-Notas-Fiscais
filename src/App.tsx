@@ -65,7 +65,9 @@ const NAV_ITEMS: Array<{
 
 function WorkspaceShell() {
   const { authReady, firebaseUser, userProfile, isAdmin, logout, dataError } = useP2P();
-  const [activeModule, setActiveModule] = useState<NavModule>('dashboard');
+  const [activeModule, setActiveModule] = useState<NavModule>(
+  DASHBOARD_ENABLED ? 'dashboard' : 'fiscal'
+);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   if (!authReady) {
@@ -91,7 +93,11 @@ function WorkspaceShell() {
     return <PendingAccessView />;
   }
 
-  const visibleNavItems = NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin);
+ const visibleNavItems = NAV_ITEMS.filter(
+  (item) =>
+    (DASHBOARD_ENABLED || item.id !== 'dashboard') &&
+    (!item.adminOnly || isAdmin)
+);
   const currentMeta = NAV_ITEMS.find((i) => i.id === activeModule) || NAV_ITEMS[0];
 
   const handleSelectNav = (id: NavModule) => {
@@ -266,7 +272,7 @@ function WorkspaceShell() {
               </div>
             </div>
           )}
-          {activeModule === 'dashboard' && <DashboardModule onNavigate={handleSelectNav} />}
+          {DASHBOARD_ENABLED && activeModule === 'dashboard' && <DashboardModule onNavigate={handleSelectNav} />}
           {activeModule === 'compras' && <ComprasModule />}
           {activeModule === 'recebimento' && <RecebimentoModule />}
           {activeModule === 'fiscal' && <FiscalModule />}
