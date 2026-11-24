@@ -1,0 +1,771 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Primitive Helpers
+    // -------------------------------------------------------------------------
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(uid) {
+      return isVerified() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isVerified() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email.lower() == 'pedrohsouzamuniz@gmail.com'
+      );
+    }
+
+    function userDocExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function userData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasSectorRole(roleName) {
+      return isVerified() && userDocExists() &&
+        userData().status == 'ativo' &&
+        userData().role == roleName;
+    }
+
+    function sectorAllows(sectorName, permKey) {
+      return !exists(/databases/$(database)/documents/sector_permissions/$(sectorName)) ||
+        get(/databases/$(database)/documents/sector_permissions/$(sectorName)).data[permKey] == true;
+    }
+
+    function canActiveUserReadSector(u, ownerSector) {
+      return u.status == 'ativo' && (
+        u.role == ownerSector ||
+        (u.role in ['compras', 'recebimento', 'fiscal'] && sectorAllows(u.role, 'canViewOtherSectors'))
+      );
+    }
+
+    function canReadSectorCollection(ownerSector) {
+      return isAdmin() || (
+        userDocExists() &&
+        canActiveUserReadSector(userData(), ownerSector)
+      );
+    }
+
+    function isBootstrapPending() {
+      return !exists(/databases/$(database)/documents/system_config/bootstrap);
+    }
+
+    function isValidDateStr(val) {
+      return val is string && val.size() == 10 && val.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function isValidOptionalDateStr(val) {
+      return val is string && (val == '' || (val.size() == 10 && val.matches('^\\d{4}-\\d{2}-\\d{2}$')));
+    }
+
+    // -------------------------------------------------------------------------
+    // Entity Validation Blueprints
+    // -------------------------------------------------------------------------
+    function isValidSystemBootstrap(data) {
+      return data.keys().hasAll(['initialized', 'firstAdminUid', 'firstAdminEmail', 'createdAt']) &&
+        data.keys().hasOnly(['initialized', 'firstAdminUid', 'firstAdminEmail', 'createdAt']) &&
+        data.initialized == true &&
+        isValidId(data.firstAdminUid) &&
+        data.firstAdminEmail is string && data.firstAdminEmail.size() >= 3 && data.firstAdminEmail.size() <= 200 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidAdminMarker(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'name', 'email', 'photoUrl', 'role', 'sector', 'status', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'name', 'email', 'photoUrl', 'role', 'sector', 'status', 'inviteId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.photoUrl is string && data.photoUrl.size() <= 500 &&
+        data.role in ['adm_titular', 'compras', 'recebimento', 'fiscal', 'pendente'] &&
+        data.sector in ['Administração', 'Compras', 'Recebimento', 'Fiscal', 'Aguardando Aprovação'] &&
+        data.status in ['ativo', 'inativo', 'pendente'] &&
+        (!('inviteId' in data) || isValidId(data.inviteId)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserInvite(data) {
+      return data.keys().hasAll(['email', 'name', 'role', 'createdByUid', 'createdAt']) &&
+        data.keys().hasOnly(['email', 'name', 'role', 'createdByUid', 'createdAt']) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.role in ['adm_titular', 'compras', 'recebimento', 'fiscal'] &&
+        isValidId(data.createdByUid) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidSectorPermission(data) {
+      return data.keys().hasAll(['sector', 'canCreate', 'canEdit', 'canDelete', 'canViewOtherSectors', 'updatedByUid', 'updatedAt']) &&
+        data.keys().hasOnly(['sector', 'canCreate', 'canEdit', 'canDelete', 'canViewOtherSectors', 'updatedByUid', 'updatedAt']) &&
+        data.sector in ['compras', 'recebimento', 'fiscal'] &&
+        data.canCreate is bool &&
+        data.canEdit is bool &&
+        data.canDelete is bool &&
+        data.canViewOtherSectors is bool &&
+        isValidId(data.updatedByUid) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPurchaseOrder(data) {
+      return data.keys().hasAll([
+          'poNumber', 'supplierName', 'supplierCnpj', 'costCenter', 'issueDate',
+          'expectedDeliveryDate', 'paymentTerms', 'items', 'freightAmount', 'discountAmount',
+          'totalAmount', 'status', 'notes', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'poNumber', 'supplierName', 'supplierCnpj', 'costCenter', 'issueDate',
+          'expectedDeliveryDate', 'paymentTerms', 'items', 'freightAmount', 'discountAmount',
+          'totalAmount', 'status', 'notes', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'
+        ]) &&
+        data.poNumber is string && data.poNumber.size() >= 1 && data.poNumber.size() <= 40 &&
+        data.supplierName is string && data.supplierName.size() >= 1 && data.supplierName.size() <= 160 &&
+        data.supplierCnpj is string && data.supplierCnpj.size() >= 14 && data.supplierCnpj.size() <= 20 &&
+        data.costCenter is string && data.costCenter.size() >= 1 && data.costCenter.size() <= 80 &&
+        isValidDateStr(data.issueDate) &&
+        isValidDateStr(data.expectedDeliveryDate) &&
+        data.paymentTerms is string && data.paymentTerms.size() >= 1 && data.paymentTerms.size() <= 80 &&
+        data.items is list && data.items.size() >= 1 && data.items.size() <= 50 &&
+        data.items[0] is map &&
+        data.items[0].description is string && data.items[0].description.size() >= 1 && data.items[0].description.size() <= 200 &&
+        data.items[0].qtyOrdered is number && data.items[0].qtyOrdered > 0 &&
+        data.items[0].unitPrice is number && data.items[0].unitPrice >= 0 &&
+        data.freightAmount is number && data.freightAmount >= 0 &&
+        data.discountAmount is number && data.discountAmount >= 0 &&
+        data.totalAmount is number && data.totalAmount >= 0 &&
+        data.status in ['aberto', 'parcialmente_atendido', 'concluido', 'cancelado'] &&
+        data.notes is string && data.notes.size() <= 600 &&
+        isValidId(data.createdByUid) &&
+        data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 120 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPhysicalReceipt(data) {
+      return data.keys().hasAll([
+          'receiptNumber', 'purchaseOrderId', 'poNumber', 'fiscalInvoiceId', 'supplierName', 'supplierCnpj',
+          'receiptDate', 'invoiceNumberRef', 'warehouseLocation', 'items', 'status',
+          'observations', 'receivedByUid', 'receivedByName', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'receiptNumber', 'purchaseOrderId', 'poNumber', 'fiscalInvoiceId', 'supplierName', 'supplierCnpj',
+          'receiptDate', 'invoiceNumberRef', 'warehouseLocation', 'items', 'status',
+          'observations', 'receivedByUid', 'receivedByName', 'createdAt', 'updatedAt'
+        ]) &&
+        data.receiptNumber is string && data.receiptNumber.size() >= 1 && data.receiptNumber.size() <= 40 &&
+        data.purchaseOrderId is string && data.purchaseOrderId.size() <= 128 &&
+        data.poNumber is string && data.poNumber.size() <= 40 &&
+        data.fiscalInvoiceId is string && data.fiscalInvoiceId.size() <= 128 &&
+        data.supplierName is string && data.supplierName.size() >= 1 && data.supplierName.size() <= 160 &&
+        data.supplierCnpj is string && data.supplierCnpj.size() >= 11 && data.supplierCnpj.size() <= 20 &&
+        isValidDateStr(data.receiptDate) &&
+        data.invoiceNumberRef is string && data.invoiceNumberRef.size() <= 40 &&
+        data.warehouseLocation is string && data.warehouseLocation.size() >= 1 && data.warehouseLocation.size() <= 100 &&
+        data.items is list && data.items.size() >= 1 && data.items.size() <= 50 &&
+        data.items[0] is map &&
+        data.items[0].description is string && data.items[0].description.size() >= 1 && data.items[0].description.size() <= 200 &&
+        data.items[0].qtyReceived is number && data.items[0].qtyReceived >= 0 &&
+        data.status in ['conferido', 'divergencia'] &&
+        data.observations is string && data.observations.size() <= 600 &&
+        isValidId(data.receivedByUid) &&
+        data.receivedByName is string && data.receivedByName.size() >= 1 && data.receivedByName.size() <= 120 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidFiscalInvoice(data) {
+      return data.keys().hasAll([
+          'docType', 'accessKey', 'nfeNumber', 'series', 'issuerName', 'issuerCnpj', 'issueDate', 'cfop',
+          'grossAmount', 'freightAmount', 'totalProducts', 'icmsAmount', 'ipiAmount', 'pisAmount', 'cofinsAmount', 'totalInvoice',
+          'items', 'purchaseOrderId', 'poNumber', 'receiptId', 'receiptNumber', 'matchingStatus',
+          'fiscalStatus', 'bookkeepingDate', 'xmlImported', 'notes',
+          'createdByUid', 'createdByName', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'docType', 'accessKey', 'nfeNumber', 'series', 'issuerName', 'issuerCnpj', 'issuerState', 'issueDate', 'cfop',
+          'grossAmount', 'freightAmount', 'discountAmount', 'totalProducts', 'icmsAmount', 'icmsDesonAmount',
+          'ipiAmount', 'pisAmount', 'cofinsAmount', 'issqnAmount', 'inssAmount', 'irrfAmount', 'taxRegime',
+          'totalInvoice', 'complementaryInfo',
+          'items', 'purchaseOrderId', 'poNumber', 'receiptId', 'receiptNumber',
+          'linkedInvoiceId', 'linkedInvoiceNumber', 'originState', 'originCity', 'destinationState', 'destinationCity',
+          'suframaPinNumber', 'suframaPinAcceptanceDate', 'suframaPinReceiptDate', 'suframaClearanceDate',
+          'matchingStatus',
+          'fiscalStatus', 'replacedByInvoiceId', 'replacedByInvoiceNumber', 'bookkeepingDate', 'xmlImported', 'notes',
+          'createdByUid', 'createdByName', 'createdAt', 'updatedAt'
+        ]) &&
+        data.docType in ['NFE', 'NFSE', 'CTE'] &&
+        data.accessKey is string && data.accessKey.size() >= 8 && data.accessKey.size() <= 64 && data.accessKey.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.nfeNumber is string && data.nfeNumber.size() >= 1 && data.nfeNumber.size() <= 20 &&
+        data.series is string && data.series.size() >= 1 && data.series.size() <= 10 &&
+        data.issuerName is string && data.issuerName.size() >= 1 && data.issuerName.size() <= 160 &&
+        data.issuerCnpj is string && data.issuerCnpj.size() >= 11 && data.issuerCnpj.size() <= 20 &&
+        (!('issuerState' in data) || (data.issuerState is string && data.issuerState.size() <= 2)) &&
+        isValidDateStr(data.issueDate) &&
+        data.cfop is string && data.cfop.size() >= 1 && data.cfop.size() <= 16 &&
+        data.grossAmount is number && data.grossAmount >= 0 &&
+        data.freightAmount is number && data.freightAmount >= 0 &&
+        (!('discountAmount' in data) || (data.discountAmount is number && data.discountAmount >= 0)) &&
+        data.totalProducts is number && data.totalProducts >= 0 &&
+        data.icmsAmount is number && data.icmsAmount >= 0 &&
+        (!('icmsDesonAmount' in data) || (data.icmsDesonAmount is number && data.icmsDesonAmount >= 0)) &&
+        data.ipiAmount is number && data.ipiAmount >= 0 &&
+        data.pisAmount is number && data.pisAmount >= 0 &&
+        data.cofinsAmount is number && data.cofinsAmount >= 0 &&
+        (!('issqnAmount' in data) || (data.issqnAmount is number && data.issqnAmount >= 0)) &&
+        (!('inssAmount' in data) || (data.inssAmount is number && data.inssAmount >= 0)) &&
+        (!('irrfAmount' in data) || (data.irrfAmount is number && data.irrfAmount >= 0)) &&
+        (!('taxRegime' in data) || data.taxRegime in ['', 'mei', 'simples_nacional', 'regime_normal']) &&
+        data.totalInvoice is number && data.totalInvoice >= 0 &&
+        (!('complementaryInfo' in data) || (data.complementaryInfo is string && data.complementaryInfo.size() <= 3000)) &&
+        data.items is list && data.items.size() >= 1 && data.items.size() <= 50 &&
+        data.items[0] is map &&
+        data.items[0].description is string && data.items[0].description.size() >= 1 && data.items[0].description.size() <= 200 &&
+        data.items[0].qty is number && data.items[0].qty > 0 &&
+        data.purchaseOrderId is string && data.purchaseOrderId.size() <= 128 &&
+        data.poNumber is string && data.poNumber.size() <= 40 &&
+        data.receiptId is string && data.receiptId.size() <= 128 &&
+        data.receiptNumber is string && data.receiptNumber.size() <= 40 &&
+        (!('linkedInvoiceId' in data) || (data.linkedInvoiceId is string && data.linkedInvoiceId.size() <= 128)) &&
+        (!('linkedInvoiceNumber' in data) || (data.linkedInvoiceNumber is string && data.linkedInvoiceNumber.size() <= 20)) &&
+        (!('originState' in data) || (data.originState is string && data.originState.size() <= 2)) &&
+        (!('originCity' in data) || (data.originCity is string && data.originCity.size() <= 120)) &&
+        (!('destinationState' in data) || (data.destinationState is string && data.destinationState.size() <= 2)) &&
+        (!('destinationCity' in data) || (data.destinationCity is string && data.destinationCity.size() <= 120)) &&
+        (!('suframaPinNumber' in data) || (data.suframaPinNumber is string && data.suframaPinNumber.size() <= 40)) &&
+        (!('suframaPinAcceptanceDate' in data) || isValidOptionalDateStr(data.suframaPinAcceptanceDate)) &&
+        (!('suframaPinReceiptDate' in data) || isValidOptionalDateStr(data.suframaPinReceiptDate)) &&
+        (!('suframaClearanceDate' in data) || isValidOptionalDateStr(data.suframaClearanceDate)) &&
+        data.matchingStatus in ['pendente_vinculo', 'conciliada', 'divergente'] &&
+        data.fiscalStatus in ['aguardando_recebimento', 'pendente', 'lancado', 'substituida', 'aguardando_escrituracao', 'escriturada', 'rejeitada'] &&
+        (!('replacedByInvoiceId' in data) || (data.replacedByInvoiceId is string && data.replacedByInvoiceId.size() <= 128)) &&
+        (!('replacedByInvoiceNumber' in data) || (data.replacedByInvoiceNumber is string && data.replacedByInvoiceNumber.size() <= 20)) &&
+        isValidOptionalDateStr(data.bookkeepingDate) &&
+        data.xmlImported is bool &&
+        data.notes is string && data.notes.size() <= 600 &&
+        isValidId(data.createdByUid) &&
+        data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 120 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidDeletionPolicy(data) {
+      return data.keys().hasAll(['enabled', 'salt', 'updatedByUid', 'updatedByName', 'updatedAt']) &&
+        data.keys().hasOnly(['enabled', 'salt', 'updatedByUid', 'updatedByName', 'updatedAt']) &&
+        data.enabled == true &&
+        data.salt is string && data.salt.size() >= 16 && data.salt.size() <= 64 && data.salt.matches('^[a-fA-F0-9]+$') &&
+        isValidId(data.updatedByUid) &&
+        data.updatedByName is string && data.updatedByName.size() >= 1 && data.updatedByName.size() <= 120 &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidDeletionSecret(data) {
+      return data.keys().hasAll(['passwordHash', 'updatedByUid', 'updatedAt']) &&
+        data.keys().hasOnly(['passwordHash', 'updatedByUid', 'updatedAt']) &&
+        data.passwordHash is string && data.passwordHash.size() == 64 && data.passwordHash.matches('^[a-fA-F0-9]+$') &&
+        isValidId(data.updatedByUid) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidDeletionLog(data) {
+      return data.keys().hasAll(['targetCollection', 'targetId', 'targetLabel', 'submittedHash', 'deletedByUid', 'deletedByName', 'createdAt']) &&
+        data.keys().hasOnly(['targetCollection', 'targetId', 'targetLabel', 'submittedHash', 'deletedByUid', 'deletedByName', 'createdAt']) &&
+        data.targetCollection in ['purchase_orders', 'physical_receipts', 'fiscal_invoices'] &&
+        isValidId(data.targetId) &&
+        data.targetLabel is string && data.targetLabel.size() >= 1 && data.targetLabel.size() <= 80 &&
+        data.submittedHash is string && data.submittedHash.size() == 64 && data.submittedHash.matches('^[a-fA-F0-9]+$') &&
+        isValidId(data.deletedByUid) &&
+        data.deletedByName is string && data.deletedByName.size() >= 1 && data.deletedByName.size() <= 120 &&
+        data.createdAt is timestamp;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection Rules
+    // -------------------------------------------------------------------------
+
+    // System configs (bootstrap, deletion policy salt, and admin-only deletion secret hash)
+    match /system_config/{configId} {
+      allow get: if isVerified() && isValidId(configId) && (
+        configId == 'bootstrap' ||
+        (configId == 'deletion_policy' && (isAdmin() || (userDocExists() && userData().status == 'ativo'))) ||
+        (configId == 'deletion_secret' && isAdmin())
+      );
+      allow create: if isVerified() && isValidId(configId) && (
+        (
+          configId == 'bootstrap' &&
+          isBootstrapPending() &&
+          isValidSystemBootstrap(incoming()) &&
+          incoming().firstAdminUid == request.auth.uid &&
+          incoming().firstAdminEmail == request.auth.token.email &&
+          incoming().createdAt == request.time &&
+          existsAfter(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+          existsAfter(/databases/$(database)/documents/users/$(request.auth.uid))
+        ) ||
+        (
+          configId == 'deletion_policy' &&
+          isAdmin() &&
+          isValidDeletionPolicy(incoming()) &&
+          incoming().updatedByUid == request.auth.uid &&
+          incoming().updatedAt == request.time
+        ) ||
+        (
+          configId == 'deletion_secret' &&
+          isAdmin() &&
+          isValidDeletionSecret(incoming()) &&
+          incoming().updatedByUid == request.auth.uid &&
+          incoming().updatedAt == request.time
+        )
+      );
+      allow update: if isVerified() && isValidId(configId) && (
+        (
+          configId == 'deletion_policy' &&
+          isAdmin() &&
+          isValidDeletionPolicy(incoming()) &&
+          incoming().updatedByUid == request.auth.uid &&
+          incoming().updatedAt == request.time
+        ) ||
+        (
+          configId == 'deletion_secret' &&
+          isAdmin() &&
+          isValidDeletionSecret(incoming()) &&
+          incoming().updatedByUid == request.auth.uid &&
+          incoming().updatedAt == request.time
+        )
+      );
+      allow delete: if false;
+    }
+
+    // Deletion authorization audit logs (immutable)
+    match /deletion_logs/{logId} {
+      allow get, list: if isAdmin();
+      allow create: if isVerified() &&
+        isValidId(logId) &&
+        isValidDeletionLog(incoming()) &&
+        incoming().deletedByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        logId == (request.auth.uid + '_' + incoming().targetId) &&
+        exists(/databases/$(database)/documents/system_config/deletion_secret) &&
+        incoming().submittedHash == get(/databases/$(database)/documents/system_config/deletion_secret).data.passwordHash;
+      allow update, delete: if false;
+    }
+
+    // Admin markers
+    match /admins/{adminId} {
+      allow get: if isVerified() && isValidId(adminId) && (isOwner(adminId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isVerified() &&
+        isValidId(adminId) &&
+        isValidAdminMarker(incoming()) &&
+        incoming().createdAt == request.time && (
+          isAdmin() ||
+          (
+            adminId == request.auth.uid &&
+            incoming().uid == request.auth.uid &&
+            isBootstrapPending() &&
+            existsAfter(/databases/$(database)/documents/system_config/bootstrap)
+          ) ||
+          (
+            adminId == request.auth.uid &&
+            incoming().uid == request.auth.uid &&
+            userDocExists() &&
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'adm_titular'
+          )
+        );
+      allow delete: if isAdmin() && isValidId(adminId) && adminId != request.auth.uid;
+      allow update: if false;
+    }
+
+    // Users (PII Isolated: email only readable by owner or ADM Titular)
+    match /users/{userId} {
+      allow get: if isVerified() && isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isVerified() && (isAdmin() || existing().uid == request.auth.uid);
+
+      allow create: if isVerified() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            userId == request.auth.uid &&
+            incoming().uid == request.auth.uid &&
+            isBootstrapPending() &&
+            incoming().role == 'adm_titular' &&
+            incoming().sector == 'Administração' &&
+            incoming().status == 'ativo' &&
+            existsAfter(/databases/$(database)/documents/system_config/bootstrap) &&
+            existsAfter(/databases/$(database)/documents/admins/$(request.auth.uid))
+          ) ||
+          (
+            userId == request.auth.uid &&
+            incoming().uid == request.auth.uid &&
+            'inviteId' in incoming() &&
+            exists(/databases/$(database)/documents/user_invites/$(incoming().inviteId)) &&
+            get(/databases/$(database)/documents/user_invites/$(incoming().inviteId)).data.email == request.auth.token.email.lower() &&
+            incoming().role == get(/databases/$(database)/documents/user_invites/$(incoming().inviteId)).data.role &&
+            incoming().status == 'ativo'
+          ) ||
+          (
+            userId == request.auth.uid &&
+            incoming().uid == request.auth.uid &&
+            !isBootstrapPending() &&
+            !('inviteId' in incoming()) &&
+            incoming().role == 'pendente' &&
+            incoming().sector == 'Aguardando Aprovação' &&
+            incoming().status == 'pendente'
+          )
+        );
+
+      allow update: if isVerified() &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            isOwner(userId) &&
+            incoming().role == existing().role &&
+            incoming().sector == existing().sector &&
+            incoming().status == existing().status &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'photoUrl', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isAdmin() && isValidId(userId) && userId != request.auth.uid;
+    }
+
+    // User invites created by ADM Titular
+    match /user_invites/{inviteId} {
+      allow get: if isVerified() && isValidId(inviteId) && (
+        isAdmin() || existing().email == request.auth.token.email.lower()
+      );
+      allow list: if isVerified() && (
+        isAdmin() || existing().email == request.auth.token.email.lower()
+      );
+      allow create: if isAdmin() &&
+        isValidId(inviteId) &&
+        isValidUserInvite(incoming()) &&
+        incoming().createdByUid == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update: if isAdmin() &&
+        isValidId(inviteId) &&
+        isValidUserInvite(incoming()) &&
+        incoming().createdByUid == existing().createdByUid &&
+        incoming().createdAt == existing().createdAt;
+      allow delete: if isAdmin() && isValidId(inviteId);
+    }
+
+    // Sector permissions matrix configured by ADM Titular
+    match /sector_permissions/{sectorId} {
+      allow get: if isVerified() && isValidId(sectorId) && sectorId in ['compras', 'recebimento', 'fiscal'];
+      allow list: if isVerified() && (isAdmin() || (userDocExists() && userData().status == 'ativo'));
+      allow create: if isVerified() &&
+        isValidId(sectorId) &&
+        sectorId in ['compras', 'recebimento', 'fiscal'] &&
+        isValidSectorPermission(incoming()) &&
+        incoming().sector == sectorId &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            isBootstrapPending() &&
+            incoming().updatedByUid == request.auth.uid &&
+            existsAfter(/databases/$(database)/documents/system_config/bootstrap)
+          )
+        );
+      allow update: if isAdmin() &&
+        isValidId(sectorId) &&
+        sectorId in ['compras', 'recebimento', 'fiscal'] &&
+        isValidSectorPermission(incoming()) &&
+        incoming().sector == existing().sector &&
+        incoming().updatedByUid == request.auth.uid &&
+        incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // Purchase Orders (Exclusive write: Compras + ADM Titular)
+    match /purchase_orders/{orderId} {
+      allow get: if isVerified() && isValidId(orderId) && canReadSectorCollection('compras');
+      allow list: if isVerified() && canReadSectorCollection('compras');
+
+      allow create: if isVerified() &&
+        isValidId(orderId) &&
+        isValidPurchaseOrder(incoming()) &&
+        incoming().createdByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (hasSectorRole('compras') && sectorAllows('compras', 'canCreate'))
+        );
+
+      allow update: if isVerified() &&
+        isValidId(orderId) &&
+        isValidPurchaseOrder(incoming()) &&
+        incoming().createdByUid == existing().createdByUid &&
+        incoming().createdByName == existing().createdByName &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (
+            hasSectorRole('compras') &&
+            sectorAllows('compras', 'canEdit') &&
+            existing().status != 'cancelado' &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'poNumber', 'supplierName', 'supplierCnpj', 'costCenter',
+              'issueDate', 'expectedDeliveryDate', 'paymentTerms',
+              'items', 'freightAmount', 'discountAmount', 'totalAmount',
+              'status', 'notes', 'updatedAt'
+            ])
+          ) ||
+          (
+            hasSectorRole('recebimento') &&
+            existing().status != 'cancelado' &&
+            incoming().status in ['aberto', 'parcialmente_atendido', 'concluido'] &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isVerified() && isValidId(orderId) && (
+        isAdmin() ||
+        (
+          hasSectorRole('compras') &&
+          sectorAllows('compras', 'canDelete') &&
+          existing().status != 'concluido' &&
+          existsAfter(/databases/$(database)/documents/deletion_logs/$(request.auth.uid + '_' + orderId))
+        )
+      );
+    }
+
+    // Physical Receipts (Exclusive write: Recebimento + ADM Titular)
+    match /physical_receipts/{receiptId} {
+      allow get: if isVerified() && isValidId(receiptId) && canReadSectorCollection('recebimento');
+      allow list: if isVerified() && canReadSectorCollection('recebimento');
+
+      allow create: if isVerified() &&
+        isValidId(receiptId) &&
+        isValidPhysicalReceipt(incoming()) &&
+        incoming().receivedByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().purchaseOrderId == '' ||
+          exists(/databases/$(database)/documents/purchase_orders/$(incoming().purchaseOrderId))
+        ) &&
+        (
+          incoming().fiscalInvoiceId == '' ||
+          exists(/databases/$(database)/documents/fiscal_invoices/$(incoming().fiscalInvoiceId))
+        ) && (
+          isAdmin() ||
+          (
+            hasSectorRole('recebimento') &&
+            sectorAllows('recebimento', 'canCreate') &&
+            incoming().purchaseOrderId != '' &&
+            incoming().fiscalInvoiceId != ''
+          )
+        );
+
+      allow update: if isVerified() &&
+        isValidId(receiptId) &&
+        isValidPhysicalReceipt(incoming()) &&
+        incoming().receivedByUid == existing().receivedByUid &&
+        incoming().receivedByName == existing().receivedByName &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().purchaseOrderId == '' ||
+          exists(/databases/$(database)/documents/purchase_orders/$(incoming().purchaseOrderId))
+        ) && (
+          isAdmin() ||
+          (
+            hasSectorRole('recebimento') &&
+            sectorAllows('recebimento', 'canEdit') &&
+            incoming().purchaseOrderId == existing().purchaseOrderId &&
+            incoming().poNumber == existing().poNumber &&
+            incoming().fiscalInvoiceId == existing().fiscalInvoiceId &&
+            (
+              existing().fiscalInvoiceId == '' ||
+              !(get(/databases/$(database)/documents/fiscal_invoices/$(existing().fiscalInvoiceId)).data.fiscalStatus in ['lancado', 'escriturada'])
+            ) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'receiptDate', 'invoiceNumberRef', 'warehouseLocation',
+              'items', 'status', 'observations', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerified() && isValidId(receiptId) && (
+        isAdmin() ||
+        (
+          hasSectorRole('recebimento') &&
+          sectorAllows('recebimento', 'canDelete') &&
+          (
+            existing().fiscalInvoiceId == '' ||
+            !(get(/databases/$(database)/documents/fiscal_invoices/$(existing().fiscalInvoiceId)).data.fiscalStatus in ['lancado', 'escriturada'])
+          ) &&
+          existsAfter(/databases/$(database)/documents/deletion_logs/$(request.auth.uid + '_' + receiptId))
+        )
+      );
+    }
+
+    // Fiscal Invoices (Exclusive write: Fiscal + ADM Titular, plus Recebimento atomic transition aguardando_recebimento -> pendente)
+    match /fiscal_invoices/{invoiceId} {
+      allow get: if isVerified() && isValidId(invoiceId) && canReadSectorCollection('fiscal');
+      allow list: if isVerified() && canReadSectorCollection('fiscal');
+
+      allow create: if isVerified() &&
+        isValidId(invoiceId) &&
+        isValidFiscalInvoice(incoming()) &&
+        incoming().createdByUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().purchaseOrderId == '' ||
+          exists(/databases/$(database)/documents/purchase_orders/$(incoming().purchaseOrderId))
+        ) &&
+        (
+          incoming().receiptId == '' ||
+          exists(/databases/$(database)/documents/physical_receipts/$(incoming().receiptId))
+        ) &&
+        (
+          !('linkedInvoiceId' in incoming()) ||
+          incoming().linkedInvoiceId == '' ||
+          exists(/databases/$(database)/documents/fiscal_invoices/$(incoming().linkedInvoiceId))
+        ) && (
+          isAdmin() ||
+          (hasSectorRole('fiscal') && sectorAllows('fiscal', 'canCreate'))
+        );
+
+      allow update: if isVerified() &&
+        isValidId(invoiceId) &&
+        isValidFiscalInvoice(incoming()) &&
+        incoming().createdByUid == existing().createdByUid &&
+        incoming().createdByName == existing().createdByName &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().purchaseOrderId == '' ||
+          exists(/databases/$(database)/documents/purchase_orders/$(incoming().purchaseOrderId))
+        ) &&
+        (
+          incoming().receiptId == '' ||
+          existsAfter(/databases/$(database)/documents/physical_receipts/$(incoming().receiptId)) ||
+          exists(/databases/$(database)/documents/physical_receipts/$(incoming().receiptId))
+        ) &&
+        (
+          !('replacedByInvoiceId' in incoming()) ||
+          incoming().replacedByInvoiceId == '' ||
+          exists(/databases/$(database)/documents/fiscal_invoices/$(incoming().replacedByInvoiceId))
+        ) &&
+        (
+          !('linkedInvoiceId' in incoming()) ||
+          incoming().linkedInvoiceId == '' ||
+          exists(/databases/$(database)/documents/fiscal_invoices/$(incoming().linkedInvoiceId))
+        ) && (
+          isAdmin() ||
+          (
+            hasSectorRole('fiscal') &&
+            sectorAllows('fiscal', 'canEdit') &&
+            !(existing().fiscalStatus in ['lancado', 'escriturada']) &&
+            (
+              !(incoming().fiscalStatus in ['lancado', 'escriturada']) ||
+              (
+                incoming().receiptId != '' &&
+                exists(/databases/$(database)/documents/physical_receipts/$(incoming().receiptId))
+              )
+            ) &&
+            (existing().purchaseOrderId == '' || incoming().purchaseOrderId == existing().purchaseOrderId) &&
+            (existing().receiptId == '' || incoming().receiptId == existing().receiptId) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'purchaseOrderId', 'poNumber', 'receiptId', 'receiptNumber',
+              'linkedInvoiceId', 'linkedInvoiceNumber',
+              'originState', 'originCity', 'destinationState', 'destinationCity',
+              'issuerState', 'suframaPinNumber', 'suframaPinAcceptanceDate', 'suframaPinReceiptDate', 'suframaClearanceDate',
+              'taxRegime', 'pisAmount', 'cofinsAmount', 'issqnAmount', 'inssAmount', 'irrfAmount',
+              'matchingStatus', 'fiscalStatus', 'replacedByInvoiceId', 'replacedByInvoiceNumber',
+              'bookkeepingDate', 'cfop', 'notes', 'updatedAt'
+            ])
+          ) ||
+          (
+            hasSectorRole('recebimento') &&
+            existing().fiscalStatus == 'aguardando_recebimento' &&
+            incoming().fiscalStatus == 'pendente' &&
+            incoming().purchaseOrderId != '' &&
+            incoming().receiptId != '' &&
+            existsAfter(/databases/$(database)/documents/physical_receipts/$(incoming().receiptId)) &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'purchaseOrderId', 'poNumber', 'receiptId', 'receiptNumber',
+              'matchingStatus', 'fiscalStatus', 'updatedAt'
+            ])
+          ) ||
+          (
+            hasSectorRole('recebimento') &&
+            sectorAllows('recebimento', 'canDelete') &&
+            !(existing().fiscalStatus in ['lancado', 'escriturada']) &&
+            existing().receiptId != '' &&
+            !existsAfter(/databases/$(database)/documents/physical_receipts/$(existing().receiptId)) &&
+            incoming().fiscalStatus == 'aguardando_recebimento' &&
+            incoming().purchaseOrderId == '' &&
+            incoming().poNumber == '' &&
+            incoming().receiptId == '' &&
+            incoming().receiptNumber == '' &&
+            incoming().matchingStatus == 'pendente_vinculo' &&
+            incoming().bookkeepingDate == '' &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'purchaseOrderId', 'poNumber', 'receiptId', 'receiptNumber',
+              'matchingStatus', 'fiscalStatus', 'bookkeepingDate', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isVerified() && isValidId(invoiceId) && (
+        isAdmin() ||
+        (
+          hasSectorRole('fiscal') &&
+          sectorAllows('fiscal', 'canDelete') &&
+          !(existing().fiscalStatus in ['lancado', 'escriturada']) &&
+          existsAfter(/databases/$(database)/documents/deletion_logs/$(request.auth.uid + '_' + invoiceId))
+        )
+      );
+    }
+
+    // Connectivity test document
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+  }
+}

@@ -1,0 +1,755 @@
+{
+  "entities": {
+    "SystemBootstrap": {
+      "title": "SystemBootstrap",
+      "description": "Registro único de inicialização que garante que o primeiro usuário cadastrado seja o ADM Titular.",
+      "type": "object",
+      "properties": {
+        "initialized": {
+          "type": "boolean",
+          "description": "Indica se o primeiro ADM Titular já foi cadastrado."
+        },
+        "firstAdminUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID do primeiro ADM Titular."
+        },
+        "firstAdminEmail": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 200,
+          "description": "E-mail do primeiro ADM Titular."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Data de criação no servidor."
+        }
+      },
+      "required": ["initialized", "firstAdminUid", "firstAdminEmail", "createdAt"]
+    },
+    "AdminMarker": {
+      "title": "AdminMarker",
+      "description": "Documento marcador de privilégio de ADM Titular.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 200
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt"]
+    },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Perfil corporativo de usuário com setor e papel RBAC.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 200
+        },
+        "photoUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "role": {
+          "type": "string",
+          "enum": ["adm_titular", "compras", "recebimento", "fiscal", "pendente"]
+        },
+        "sector": {
+          "type": "string",
+          "enum": ["Administração", "Compras", "Recebimento", "Fiscal", "Aguardando Aprovação"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ativo", "inativo", "pendente"]
+        },
+        "inviteId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "name", "email", "photoUrl", "role", "sector", "status", "createdAt", "updatedAt"]
+    },
+    "UserInvite": {
+      "title": "UserInvite",
+      "description": "Pré-cadastro de usuário corporativo criado pelo ADM Titular.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 200
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "enum": ["adm_titular", "compras", "recebimento", "fiscal"]
+        },
+        "createdByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["email", "name", "role", "createdByUid", "createdAt"]
+    },
+    "SectorPermission": {
+      "title": "SectorPermission",
+      "description": "Permissões granulares por setor configuradas pelo ADM Titular.",
+      "type": "object",
+      "properties": {
+        "sector": {
+          "type": "string",
+          "enum": ["compras", "recebimento", "fiscal"]
+        },
+        "canCreate": {
+          "type": "boolean"
+        },
+        "canEdit": {
+          "type": "boolean"
+        },
+        "canDelete": {
+          "type": "boolean"
+        },
+        "canViewOtherSectors": {
+          "type": "boolean"
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["sector", "canCreate", "canEdit", "canDelete", "canViewOtherSectors", "updatedByUid", "updatedAt"]
+    },
+    "PurchaseOrder": {
+      "title": "PurchaseOrder",
+      "description": "Pedido de Compra emitido pelo setor de Compras.",
+      "type": "object",
+      "properties": {
+        "poNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "supplierName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "supplierCnpj": {
+          "type": "string",
+          "minLength": 14,
+          "maxLength": 20
+        },
+        "costCenter": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "issueDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "maxLength": 10
+        },
+        "expectedDeliveryDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "maxLength": 10
+        },
+        "paymentTerms": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "items": {
+          "type": "array",
+          "description": "Lista limitada (máximo 50 itens) do pedido de compra."
+        },
+        "freightAmount": {
+          "type": "number",
+          "description": "Valor do frete do pedido de compra."
+        },
+        "discountAmount": {
+          "type": "number",
+          "description": "Valor de descontos aplicados ao pedido."
+        },
+        "totalAmount": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["aberto", "parcialmente_atendido", "concluido", "cancelado"]
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "createdByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "poNumber",
+        "supplierName",
+        "supplierCnpj",
+        "costCenter",
+        "issueDate",
+        "expectedDeliveryDate",
+        "paymentTerms",
+        "items",
+        "freightAmount",
+        "discountAmount",
+        "totalAmount",
+        "status",
+        "notes",
+        "createdByUid",
+        "createdByName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PhysicalReceipt": {
+      "title": "PhysicalReceipt",
+      "description": "Registro de recebimento físico emitido pelo setor de Recebimento.",
+      "type": "object",
+      "properties": {
+        "receiptNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "purchaseOrderId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "poNumber": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "fiscalInvoiceId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "supplierName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "supplierCnpj": {
+          "type": "string",
+          "minLength": 14,
+          "maxLength": 20
+        },
+        "receiptDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "maxLength": 10
+        },
+        "invoiceNumberRef": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "warehouseLocation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "items": {
+          "type": "array",
+          "description": "Lista limitada (máximo 50 itens) conferidos fisicamente."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["conferido", "divergencia"]
+        },
+        "observations": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "receivedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "receivedByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "receiptNumber",
+        "purchaseOrderId",
+        "poNumber",
+        "fiscalInvoiceId",
+        "supplierName",
+        "supplierCnpj",
+        "receiptDate",
+        "invoiceNumberRef",
+        "warehouseLocation",
+        "items",
+        "status",
+        "observations",
+        "receivedByUid",
+        "receivedByName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "FiscalInvoice": {
+      "title": "FiscalInvoice",
+      "description": "Documento Fiscal Eletrônico (NF-e, NFS-e ou CT-e) importado via XML e escriturado pelo setor Fiscal.",
+      "type": "object",
+      "properties": {
+        "docType": {
+          "type": "string",
+          "enum": ["NFE", "NFSE", "CTE"]
+        },
+        "accessKey": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "nfeNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "series": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10
+        },
+        "issuerName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "issuerCnpj": {
+          "type": "string",
+          "minLength": 14,
+          "maxLength": 20
+        },
+        "issuerState": {
+          "type": "string",
+          "maxLength": 2
+        },
+        "issueDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "maxLength": 10
+        },
+        "cfop": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "grossAmount": {
+          "type": "number"
+        },
+        "freightAmount": {
+          "type": "number"
+        },
+        "discountAmount": {
+          "type": "number"
+        },
+        "totalProducts": {
+          "type": "number"
+        },
+        "icmsAmount": {
+          "type": "number"
+        },
+        "icmsDesonAmount": {
+          "type": "number"
+        },
+        "ipiAmount": {
+          "type": "number"
+        },
+        "pisAmount": {
+          "type": "number"
+        },
+        "cofinsAmount": {
+          "type": "number"
+        },
+        "issqnAmount": {
+          "type": "number"
+        },
+        "inssAmount": {
+          "type": "number"
+        },
+        "irrfAmount": {
+          "type": "number"
+        },
+        "taxRegime": {
+          "type": "string",
+          "enum": ["", "mei", "simples_nacional", "regime_normal"]
+        },
+        "totalInvoice": {
+          "type": "number"
+        },
+        "complementaryInfo": {
+          "type": "string",
+          "maxLength": 3000
+        },
+        "items": {
+          "type": "array",
+          "description": "Lista limitada (máximo 50 itens) extraídos do XML ou informados."
+        },
+        "purchaseOrderId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "poNumber": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "receiptId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "receiptNumber": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "linkedInvoiceId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "linkedInvoiceNumber": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "originState": {
+          "type": "string",
+          "maxLength": 2
+        },
+        "originCity": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "destinationState": {
+          "type": "string",
+          "maxLength": 2
+        },
+        "destinationCity": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "suframaPinNumber": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "suframaPinAcceptanceDate": {
+          "type": "string",
+          "maxLength": 10
+        },
+        "suframaPinReceiptDate": {
+          "type": "string",
+          "maxLength": 10
+        },
+        "suframaClearanceDate": {
+          "type": "string",
+          "maxLength": 10
+        },
+        "matchingStatus": {
+          "type": "string",
+          "enum": ["pendente_vinculo", "conciliada", "divergente"]
+        },
+        "fiscalStatus": {
+          "type": "string",
+          "enum": ["aguardando_recebimento", "pendente", "lancado", "substituida", "aguardando_escrituracao", "escriturada", "rejeitada"]
+        },
+        "replacedByInvoiceId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "replacedByInvoiceNumber": {
+          "type": "string",
+          "maxLength": 20
+        },
+        "bookkeepingDate": {
+          "type": "string",
+          "maxLength": 10
+        },
+        "xmlImported": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "createdByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "docType",
+        "accessKey",
+        "nfeNumber",
+        "series",
+        "issuerName",
+        "issuerCnpj",
+        "issueDate",
+        "cfop",
+        "grossAmount",
+        "freightAmount",
+        "totalProducts",
+        "icmsAmount",
+        "ipiAmount",
+        "pisAmount",
+        "cofinsAmount",
+        "totalInvoice",
+        "items",
+        "purchaseOrderId",
+        "poNumber",
+        "receiptId",
+        "receiptNumber",
+        "matchingStatus",
+        "fiscalStatus",
+        "bookkeepingDate",
+        "xmlImported",
+        "notes",
+        "createdByUid",
+        "createdByName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DeletionPolicy": {
+      "title": "DeletionPolicy",
+      "description": "Política pública de salt para validação da senha de Supervisor/Analista em exclusões.",
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "salt": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 64,
+          "pattern": "^[a-fA-F0-9]+$"
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["enabled", "salt", "updatedByUid", "updatedByName", "updatedAt"]
+    },
+    "DeletionSecret": {
+      "title": "DeletionSecret",
+      "description": "Hash SHA-256 protegido da senha de Supervisor/Analista, legível apenas pelo ADM Titular e regras de validação.",
+      "type": "object",
+      "properties": {
+        "passwordHash": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-fA-F0-9]+$"
+        },
+        "updatedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["passwordHash", "updatedByUid", "updatedAt"]
+    },
+    "DeletionLog": {
+      "title": "DeletionLog",
+      "description": "Registro de auditoria e autorização de exclusões validadas por senha de Supervisor/Analista.",
+      "type": "object",
+      "properties": {
+        "targetCollection": {
+          "type": "string",
+          "enum": ["purchase_orders", "physical_receipts", "fiscal_invoices"]
+        },
+        "targetId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "targetLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "submittedHash": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[a-fA-F0-9]+$"
+        },
+        "deletedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "deletedByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "targetCollection",
+        "targetId",
+        "targetLabel",
+        "submittedHash",
+        "deletedByUid",
+        "deletedByName",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/system_config/{configId}": {
+      "schema": { "$ref": "#/entities/SystemBootstrap" },
+      "description": "Configurações do sistema (bootstrap, política e segredo de exclusão)."
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/AdminMarker" },
+      "description": "Marcador de privilégios de ADM Titular."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Perfis de usuários e papéis RBAC."
+    },
+    "/user_invites/{inviteId}": {
+      "schema": { "$ref": "#/entities/UserInvite" },
+      "description": "Pré-cadastro e convites criados pelo ADM Titular."
+    },
+    "/sector_permissions/{sectorId}": {
+      "schema": { "$ref": "#/entities/SectorPermission" },
+      "description": "Matriz de permissões por setor."
+    },
+    "/purchase_orders/{orderId}": {
+      "schema": { "$ref": "#/entities/PurchaseOrder" },
+      "description": "Pedidos de Compra do setor de Compras."
+    },
+    "/physical_receipts/{receiptId}": {
+      "schema": { "$ref": "#/entities/PhysicalReceipt" },
+      "description": "Recebimentos Físicos do setor de Recebimento."
+    },
+    "/fiscal_invoices/{invoiceId}": {
+      "schema": { "$ref": "#/entities/FiscalInvoice" },
+      "description": "Notas Fiscais e Escrituração do setor Fiscal."
+    },
+    "/deletion_logs/{logId}": {
+      "schema": { "$ref": "#/entities/DeletionLog" },
+      "description": "Auditoria e autorização de exclusões por senha de Supervisor/Analista."
+    }
+  }
+}

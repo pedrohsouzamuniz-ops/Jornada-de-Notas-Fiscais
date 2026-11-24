@@ -1,0 +1,6 @@
+{
+  "name": "Controle Fiscal P2P",
+  "description": "Sistema corporativo de gestão Procure-to-Pay para centralizar pedidos de compra, recebimento físico e escrituração fiscal com importação de XML de NF-e e controle de acesso por setor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
