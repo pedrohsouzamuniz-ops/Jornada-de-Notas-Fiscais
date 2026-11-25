@@ -257,8 +257,12 @@ export interface FiscalInvoice {
   totalProducts: number;
   icmsAmount: number;
   icmsDesonAmount?: number;
+  icmsDesonDeducted?: boolean;
   icmsStAmount?: number;
+  fcpStAmount?: number;
+  iiAmount?: number;
   ipiAmount: number;
+  ipiDevolAmount?: number;
   pisAmount: number;
   cofinsAmount: number;
   csllAmount?: number;

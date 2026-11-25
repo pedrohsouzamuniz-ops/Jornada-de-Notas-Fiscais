@@ -16,7 +16,12 @@ export interface FiscalNetCalculationInput {
   otherExpensesAmount?: number;
   surchargeAmount?: number;
   ipiAmount?: number;
+  ipiDevolAmount?: number;
   icmsStAmount?: number;
+  fcpStAmount?: number;
+  iiAmount?: number;
+  icmsDesonAmount?: number;
+  icmsDesonDeducted?: boolean;
   discountAmount?: number;
   retainedTaxesAmount?: number;
   taxRegime?: ServiceTaxRegime | '';
@@ -71,7 +76,7 @@ export function getEffectiveRetainedTaxes(input: FiscalNetCalculationInput): num
 
 /**
  * Calcula automaticamente o Valor Líquido da nota fiscal:
- * - NF-e: Produtos + Frete + Seguro + Outras Despesas + Acréscimos + IPI + ICMS ST - Descontos - Impostos Efetivamente Retidos
+ * - NF-e: Produtos + Frete + Seguro + Outras Despesas + Acréscimos + IPI + IPI Devol. + ICMS ST + FCP ST + II - Descontos - ICMS Deson. (quando deduzido) - Impostos Efetivamente Retidos
  * - NFS-e: Serviços + Outras Despesas + Acréscimos - Descontos - Retenções aplicáveis ao regime
  * - CT-e: Valor da Prestação + Seguro + Outras Despesas + Acréscimos - Descontos - Impostos Efetivamente Retidos (sem duplicar frete)
  */
@@ -83,7 +88,14 @@ export function calculateFiscalNetTotal(input: FiscalNetCalculationInput): numbe
   const otherExpenses = Math.max(0, Number(input.otherExpensesAmount || 0));
   const surcharge = Math.max(0, Number(input.surchargeAmount || 0));
   const ipi = input.docType === 'NFE' ? Math.max(0, Number(input.ipiAmount || 0)) : 0;
+  const ipiDevol = input.docType === 'NFE' ? Math.max(0, Number(input.ipiDevolAmount || 0)) : 0;
   const icmsSt = input.docType === 'NFE' ? Math.max(0, Number(input.icmsStAmount || 0)) : 0;
+  const fcpSt = input.docType === 'NFE' ? Math.max(0, Number(input.fcpStAmount || 0)) : 0;
+  const ii = input.docType === 'NFE' ? Math.max(0, Number(input.iiAmount || 0)) : 0;
+  const icmsDeson =
+    input.docType === 'NFE' && input.icmsDesonDeducted !== false
+      ? Math.max(0, Number(input.icmsDesonAmount || 0))
+      : 0;
   const discount = Math.max(0, Number(input.discountAmount || 0));
   const retainedTaxes = getEffectiveRetainedTaxes(input);
 
@@ -94,10 +106,44 @@ export function calculateFiscalNetTotal(input: FiscalNetCalculationInput): numbe
     otherExpenses +
     surcharge +
     ipi +
-    icmsSt -
+    ipiDevol +
+    icmsSt +
+    fcpSt +
+    ii -
     discount -
+    icmsDeson -
     retainedTaxes;
   return roundMoney(Math.max(0, rawNet));
+}
+
+export function resolveEffectiveIcmsDesonDeducted(params: {
+  docType: FiscalDocType;
+  icmsDesonAmount?: number;
+  icmsDesonDeducted?: boolean;
+  xmlDeclaredTotal?: number;
+  totalWithoutDeson: number;
+}): boolean {
+  if (typeof params.icmsDesonDeducted === 'boolean') {
+    return params.icmsDesonDeducted;
+  }
+  const deson = Math.max(0, Number(params.icmsDesonAmount || 0));
+  if (params.docType !== 'NFE' || deson <= 0) {
+    return false;
+  }
+  if (typeof params.xmlDeclaredTotal === 'number' && params.xmlDeclaredTotal > 0) {
+    const withDeson = roundMoney(Math.max(0, params.totalWithoutDeson - deson));
+    const withoutDeson = roundMoney(Math.max(0, params.totalWithoutDeson));
+    const diffWith = Math.abs(withDeson - params.xmlDeclaredTotal);
+    const diffWithout = Math.abs(withoutDeson - params.xmlDeclaredTotal);
+    if (diffWithout <= 0.02 && diffWith > 0.02) {
+      return false;
+    }
+    if (diffWith <= 0.02 && diffWithout > 0.02) {
+      return true;
+    }
+    return diffWith <= diffWithout;
+  }
+  return true;
 }
 
 export interface FinancialComparisonInput {
@@ -209,7 +255,12 @@ export function buildConferenceFingerprint(params: {
     | 'surchargeAmount'
     | 'discountAmount'
     | 'ipiAmount'
+    | 'ipiDevolAmount'
     | 'icmsStAmount'
+    | 'fcpStAmount'
+    | 'iiAmount'
+    | 'icmsDesonAmount'
+    | 'icmsDesonDeducted'
     | 'pisAmount'
     | 'cofinsAmount'
     | 'csllAmount'
@@ -277,7 +328,12 @@ export function buildConferenceFingerprint(params: {
     Number(inv.surchargeAmount || 0).toFixed(2),
     Number(inv.discountAmount || 0).toFixed(2),
     Number(inv.ipiAmount || 0).toFixed(2),
+    Number(inv.ipiDevolAmount || 0).toFixed(2),
     Number(inv.icmsStAmount || 0).toFixed(2),
+    Number(inv.fcpStAmount || 0).toFixed(2),
+    Number(inv.iiAmount || 0).toFixed(2),
+    Number(inv.icmsDesonAmount || 0).toFixed(2),
+    String(inv.icmsDesonDeducted ?? true),
     Number(inv.pisAmount || 0).toFixed(2),
     Number(inv.cofinsAmount || 0).toFixed(2),
     Number(inv.csllAmount || 0).toFixed(2),

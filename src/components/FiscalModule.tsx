@@ -44,6 +44,7 @@ import {
   buildConferenceFingerprint,
   calculateFiscalNetTotal,
   formatFiscalActionError,
+  resolveEffectiveIcmsDesonDeducted,
 } from '../utils/fiscalCalculations';
 import {
   formatAccessKeyShort,
@@ -186,8 +187,12 @@ export function FiscalModule() {
   const [editDiscountAmount, setEditDiscountAmount] = useState<number>(0);
   const [editIcmsAmount, setEditIcmsAmount] = useState<number>(0);
   const [editIcmsDesonAmount, setEditIcmsDesonAmount] = useState<number>(0);
+  const [editIcmsDesonDeducted, setEditIcmsDesonDeducted] = useState<boolean>(true);
   const [editIcmsStAmount, setEditIcmsStAmount] = useState<number>(0);
+  const [editFcpStAmount, setEditFcpStAmount] = useState<number>(0);
+  const [editIiAmount, setEditIiAmount] = useState<number>(0);
   const [editIpiAmount, setEditIpiAmount] = useState<number>(0);
+  const [editIpiDevolAmount, setEditIpiDevolAmount] = useState<number>(0);
   const [editRetainedTaxesAmount, setEditRetainedTaxesAmount] = useState<number>(0);
   const [editPisAmount, setEditPisAmount] = useState<number>(0);
   const [editCofinsAmount, setEditCofinsAmount] = useState<number>(0);
@@ -234,8 +239,12 @@ export function FiscalModule() {
   const [manualDiscountAmount, setManualDiscountAmount] = useState<number>(0);
   const [manualIcmsAmount, setManualIcmsAmount] = useState<number>(0);
   const [manualIcmsDesonAmount, setManualIcmsDesonAmount] = useState<number>(0);
+  const [manualIcmsDesonDeducted, setManualIcmsDesonDeducted] = useState<boolean>(true);
   const [manualIcmsStAmount, setManualIcmsStAmount] = useState<number>(0);
+  const [manualFcpStAmount, setManualFcpStAmount] = useState<number>(0);
+  const [manualIiAmount, setManualIiAmount] = useState<number>(0);
   const [manualIpiAmount, setManualIpiAmount] = useState<number>(0);
+  const [manualIpiDevolAmount, setManualIpiDevolAmount] = useState<number>(0);
   const [manualRetainedTaxesAmount, setManualRetainedTaxesAmount] = useState<number>(0);
   const [manualPisAmount, setManualPisAmount] = useState<number>(0);
   const [manualCofinsAmount, setManualCofinsAmount] = useState<number>(0);
@@ -987,7 +996,12 @@ export function FiscalModule() {
       otherExpensesAmount: parsed.otherExpensesAmount || 0,
       surchargeAmount: parsed.surchargeAmount || 0,
       ipiAmount: parsed.ipiAmount,
+      ipiDevolAmount: parsed.ipiDevolAmount || 0,
       icmsStAmount: parsed.icmsStAmount,
+      fcpStAmount: parsed.fcpStAmount || 0,
+      iiAmount: parsed.iiAmount || 0,
+      icmsDesonAmount: parsed.icmsDesonAmount || 0,
+      icmsDesonDeducted: parsed.icmsDesonDeducted ?? (parsed.icmsDesonAmount || 0) > 0,
       discountAmount: parsed.discountAmount,
       retainedTaxesAmount: parsed.retainedTaxesAmount,
       taxRegime: effectiveTaxRegime,
@@ -1172,7 +1186,12 @@ export function FiscalModule() {
             surchargeAmount: parsed.surchargeAmount || 0,
             discountAmount: parsed.discountAmount || 0,
             ipiAmount: parsed.ipiAmount,
+            ipiDevolAmount: parsed.ipiDevolAmount || 0,
             icmsStAmount: parsed.icmsStAmount || 0,
+            fcpStAmount: parsed.fcpStAmount || 0,
+            iiAmount: parsed.iiAmount || 0,
+            icmsDesonAmount: parsed.icmsDesonAmount || 0,
+            icmsDesonDeducted: parsed.icmsDesonDeducted ?? (parsed.icmsDesonAmount || 0) > 0,
             pisAmount: effectivePis,
             cofinsAmount: effectiveCofins,
             csllAmount: effectiveCsll,
@@ -1232,6 +1251,10 @@ export function FiscalModule() {
             inssAmount: effectiveInss,
             irrfAmount: effectiveIrrf,
             icmsStAmount: parsed.icmsStAmount || 0,
+            fcpStAmount: parsed.fcpStAmount || 0,
+            iiAmount: parsed.iiAmount || 0,
+            ipiDevolAmount: parsed.ipiDevolAmount || 0,
+            icmsDesonDeducted: parsed.icmsDesonDeducted ?? (parsed.icmsDesonAmount || 0) > 0,
             retainedTaxesAmount: parsed.retainedTaxesAmount || 0,
             totalInvoice: computedNetTotal,
             itemAssociations: associations,
@@ -1330,18 +1353,77 @@ export function FiscalModule() {
     setEditFiscalStatus(normalizedStatus);
     setEditBookkeepingDate(inv.bookkeepingDate || '');
     setReplacedByInvoiceId(inv.replacedByInvoiceId || '');
-    setEditTaxRegime((inv.taxRegime as ServiceTaxRegime) || 'simples_nacional');
-    setEditTotalProducts(Number(inv.totalProducts ?? inv.grossAmount ?? 0));
-    setEditFreightAmount(Number(inv.freightAmount || 0));
-    setEditInsuranceAmount(Number(inv.insuranceAmount || 0));
-    setEditOtherExpensesAmount(Number(inv.otherExpensesAmount || 0));
-    setEditSurchargeAmount(Number(inv.surchargeAmount || 0));
-    setEditDiscountAmount(Number(inv.discountAmount || 0));
+    const docType = inv.docType || 'NFE';
+    const invTotalProducts = Number(inv.totalProducts ?? inv.grossAmount ?? 0);
+    const invFreight = Number(inv.freightAmount || 0);
+    const invInsurance = Number(inv.insuranceAmount || 0);
+    const invOtherExp = Number(inv.otherExpensesAmount || 0);
+    const invSurcharge = Number(inv.surchargeAmount || 0);
+    const invDiscount = Number(inv.discountAmount || 0);
+    const invIcmsDeson = Number(inv.icmsDesonAmount || 0);
+    const invIcmsSt = Number(inv.icmsStAmount || 0);
+    const invFcpSt = Number(inv.fcpStAmount || 0);
+    const invIi = Number(inv.iiAmount || 0);
+    const invIpi = Number(inv.ipiAmount || 0);
+    const invIpiDevol = Number(inv.ipiDevolAmount || 0);
+    const invRetained = Number(inv.retainedTaxesAmount || 0);
+    const invPis = Number(inv.pisAmount || 0);
+    const invCofins = Number(inv.cofinsAmount || 0);
+    const invCsll = Number(inv.csllAmount || 0);
+    const invIssqn = Number(inv.issqnAmount || 0);
+    const invIssqnRetained = inv.issqnRetained ?? true;
+    const invInss = Number(inv.inssAmount || 0);
+    const invIrrf = Number(inv.irrfAmount || 0);
+    const invTaxRegime = (inv.taxRegime as ServiceTaxRegime) || 'simples_nacional';
+    const totalWithoutDeson = calculateFiscalNetTotal({
+      docType,
+      totalProducts: invTotalProducts,
+      freightAmount: invFreight,
+      insuranceAmount: invInsurance,
+      otherExpensesAmount: invOtherExp,
+      surchargeAmount: invSurcharge,
+      ipiAmount: invIpi,
+      ipiDevolAmount: invIpiDevol,
+      icmsStAmount: invIcmsSt,
+      fcpStAmount: invFcpSt,
+      iiAmount: invIi,
+      icmsDesonAmount: 0,
+      icmsDesonDeducted: false,
+      discountAmount: invDiscount,
+      retainedTaxesAmount: invRetained,
+      taxRegime: docType === 'NFSE' ? invTaxRegime : '',
+      pisAmount: invPis,
+      cofinsAmount: invCofins,
+      csllAmount: invCsll,
+      issqnAmount: invIssqn,
+      issqnRetained: invIssqnRetained,
+      inssAmount: invInss,
+      irrfAmount: invIrrf,
+    });
+    const effectiveDesonDeducted = resolveEffectiveIcmsDesonDeducted({
+      docType,
+      icmsDesonAmount: invIcmsDeson,
+      icmsDesonDeducted: inv.icmsDesonDeducted,
+      xmlDeclaredTotal: inv.xmlDeclaredTotal,
+      totalWithoutDeson,
+    });
+
+    setEditTaxRegime(invTaxRegime);
+    setEditTotalProducts(invTotalProducts);
+    setEditFreightAmount(invFreight);
+    setEditInsuranceAmount(invInsurance);
+    setEditOtherExpensesAmount(invOtherExp);
+    setEditSurchargeAmount(invSurcharge);
+    setEditDiscountAmount(invDiscount);
     setEditIcmsAmount(Number(inv.icmsAmount || 0));
-    setEditIcmsDesonAmount(Number(inv.icmsDesonAmount || 0));
-    setEditIcmsStAmount(Number(inv.icmsStAmount || 0));
-    setEditIpiAmount(Number(inv.ipiAmount || 0));
-    setEditRetainedTaxesAmount(Number(inv.retainedTaxesAmount || 0));
+    setEditIcmsDesonAmount(invIcmsDeson);
+    setEditIcmsDesonDeducted(effectiveDesonDeducted);
+    setEditIcmsStAmount(invIcmsSt);
+    setEditFcpStAmount(invFcpSt);
+    setEditIiAmount(invIi);
+    setEditIpiAmount(invIpi);
+    setEditIpiDevolAmount(invIpiDevol);
+    setEditRetainedTaxesAmount(invRetained);
     setEditPisAmount(Number(inv.pisAmount || 0));
     setEditCofinsAmount(Number(inv.cofinsAmount || 0));
     setEditCsllAmount(Number(inv.csllAmount || 0));
@@ -1403,7 +1485,12 @@ export function FiscalModule() {
       otherExpensesAmount: editOtherExpensesAmount,
       surchargeAmount: editSurchargeAmount,
       ipiAmount: editIpiAmount,
+      ipiDevolAmount: editIpiDevolAmount,
       icmsStAmount: editIcmsStAmount,
+      fcpStAmount: editFcpStAmount,
+      iiAmount: editIiAmount,
+      icmsDesonAmount: editIcmsDesonAmount,
+      icmsDesonDeducted: editIcmsDesonDeducted,
       discountAmount: editDiscountAmount,
       retainedTaxesAmount: editRetainedTaxesAmount,
       taxRegime: activeInvoice.docType === 'NFSE' ? editTaxRegime : '',
@@ -1423,7 +1510,12 @@ export function FiscalModule() {
     editOtherExpensesAmount,
     editSurchargeAmount,
     editIpiAmount,
+    editIpiDevolAmount,
     editIcmsStAmount,
+    editFcpStAmount,
+    editIiAmount,
+    editIcmsDesonAmount,
+    editIcmsDesonDeducted,
     editDiscountAmount,
     editRetainedTaxesAmount,
     editTaxRegime,
@@ -1614,7 +1706,12 @@ export function FiscalModule() {
         surchargeAmount: editSurchargeAmount,
         discountAmount: editDiscountAmount,
         ipiAmount: docType === 'NFE' ? editIpiAmount : 0,
+        ipiDevolAmount: docType === 'NFE' ? editIpiDevolAmount : 0,
         icmsStAmount: docType === 'NFE' ? editIcmsStAmount : 0,
+        fcpStAmount: docType === 'NFE' ? editFcpStAmount : 0,
+        iiAmount: docType === 'NFE' ? editIiAmount : 0,
+        icmsDesonAmount: docType === 'NFSE' ? 0 : editIcmsDesonAmount,
+        icmsDesonDeducted: docType === 'NFE' ? editIcmsDesonDeducted : false,
         pisAmount: editPisAmount,
         cofinsAmount: editCofinsAmount,
         csllAmount: editCsllAmount,
@@ -1622,7 +1719,8 @@ export function FiscalModule() {
         issqnRetained: editIssqnRetained,
         inssAmount: editInssAmount,
         irrfAmount: editIrrfAmount,
-        retainedTaxesAmount: docType === 'NFSE' ? 0 : editRetainedTaxesAmount,
+        retainedTaxesAmount:
+          docType === 'NFSE' && editTaxRegime === 'mei' ? 0 : editRetainedTaxesAmount,
         taxRegime: docType === 'NFSE' ? editTaxRegime : '',
         totalInvoice: editComputedTotal,
         items: activeInvoice.items,
@@ -1647,7 +1745,12 @@ export function FiscalModule() {
     editSurchargeAmount,
     editDiscountAmount,
     editIpiAmount,
+    editIpiDevolAmount,
     editIcmsStAmount,
+    editFcpStAmount,
+    editIiAmount,
+    editIcmsDesonAmount,
+    editIcmsDesonDeducted,
     editPisAmount,
     editCofinsAmount,
     editCsllAmount,
@@ -2034,10 +2137,16 @@ export function FiscalModule() {
         discountAmount: Number(editDiscountAmount || 0),
         icmsAmount: effectiveDocType === 'NFSE' ? 0 : Number(editIcmsAmount || 0),
         icmsDesonAmount: effectiveDocType === 'NFSE' ? 0 : Number(editIcmsDesonAmount || 0),
+        icmsDesonDeducted: effectiveDocType === 'NFE' ? editIcmsDesonDeducted : false,
         icmsStAmount: effectiveDocType === 'NFE' ? Number(editIcmsStAmount || 0) : 0,
+        fcpStAmount: effectiveDocType === 'NFE' ? Number(editFcpStAmount || 0) : 0,
+        iiAmount: effectiveDocType === 'NFE' ? Number(editIiAmount || 0) : 0,
         ipiAmount: effectiveDocType === 'NFE' ? Number(editIpiAmount || 0) : 0,
+        ipiDevolAmount: effectiveDocType === 'NFE' ? Number(editIpiDevolAmount || 0) : 0,
         retainedTaxesAmount:
-          effectiveDocType === 'NFSE' ? 0 : Number(editRetainedTaxesAmount || 0),
+          effectiveDocType === 'NFSE' && editTaxRegime === 'mei'
+            ? 0
+            : Number(editRetainedTaxesAmount || 0),
         taxRegime: effectiveDocType === 'NFSE' ? editTaxRegime : '',
         pisAmount:
           effectiveDocType === 'NFSE'
@@ -2149,7 +2258,12 @@ export function FiscalModule() {
         otherExpensesAmount: manualOtherExpensesAmount,
         surchargeAmount: manualSurchargeAmount,
         ipiAmount: manualIpiAmount,
+        ipiDevolAmount: manualIpiDevolAmount,
         icmsStAmount: manualIcmsStAmount,
+        fcpStAmount: manualFcpStAmount,
+        iiAmount: manualIiAmount,
+        icmsDesonAmount: manualIcmsDesonAmount,
+        icmsDesonDeducted: manualIcmsDesonDeducted,
         discountAmount: manualDiscountAmount,
         retainedTaxesAmount: manualRetainedTaxesAmount,
         taxRegime: manualDocType === 'NFSE' ? manualTaxRegime : '',
@@ -2174,7 +2288,12 @@ export function FiscalModule() {
       manualOtherExpensesAmount,
       manualSurchargeAmount,
       manualIpiAmount,
+      manualIpiDevolAmount,
       manualIcmsStAmount,
+      manualFcpStAmount,
+      manualIiAmount,
+      manualIcmsDesonAmount,
+      manualIcmsDesonDeducted,
       manualDiscountAmount,
       manualRetainedTaxesAmount,
       manualTaxRegime,
@@ -2316,8 +2435,12 @@ export function FiscalModule() {
     setManualDiscountAmount(0);
     setManualIcmsAmount(0);
     setManualIcmsDesonAmount(0);
+    setManualIcmsDesonDeducted(true);
     setManualIcmsStAmount(0);
+    setManualFcpStAmount(0);
+    setManualIiAmount(0);
     setManualIpiAmount(0);
+    setManualIpiDevolAmount(0);
     setManualRetainedTaxesAmount(0);
     setManualPisAmount(0);
     setManualCofinsAmount(0);
@@ -2628,8 +2751,12 @@ export function FiscalModule() {
             totalProducts: manualItemsSubtotal,
             icmsAmount: manualDocType === 'NFSE' ? 0 : Number(manualIcmsAmount || 0),
             icmsDesonAmount: manualDocType === 'NFSE' ? 0 : Number(manualIcmsDesonAmount || 0),
+            icmsDesonDeducted: manualDocType === 'NFE' ? manualIcmsDesonDeducted : false,
             icmsStAmount: manualDocType === 'NFE' ? Number(manualIcmsStAmount || 0) : 0,
+            fcpStAmount: manualDocType === 'NFE' ? Number(manualFcpStAmount || 0) : 0,
+            iiAmount: manualDocType === 'NFE' ? Number(manualIiAmount || 0) : 0,
             ipiAmount: manualDocType === 'NFE' ? Number(manualIpiAmount || 0) : 0,
+            ipiDevolAmount: manualDocType === 'NFE' ? Number(manualIpiDevolAmount || 0) : 0,
             pisAmount: effectivePis,
             cofinsAmount: effectiveCofins,
             csllAmount: effectiveCsll,
@@ -2638,7 +2765,9 @@ export function FiscalModule() {
             inssAmount: effectiveInss,
             irrfAmount: effectiveIrrf,
             retainedTaxesAmount:
-              manualDocType === 'NFSE' ? 0 : Number(manualRetainedTaxesAmount || 0),
+              manualDocType === 'NFSE' && manualTaxRegime === 'mei'
+                ? 0
+                : Number(manualRetainedTaxesAmount || 0),
             taxRegime: manualDocType === 'NFSE' ? manualTaxRegime : '',
             linkedInvoiceId: linkedInv?.id || '',
             linkedInvoiceNumber: linkedInv?.nfeNumber || '',
@@ -3764,6 +3893,47 @@ export function FiscalModule() {
                           {formatBRL(parsed.discountAmount || 0)}
                         </span>
                       </div>
+                      {parsed.docType === 'NFE' &&
+                        ((parsed.icmsDesonAmount || 0) > 0 ||
+                          (parsed.fcpStAmount || 0) > 0 ||
+                          (parsed.iiAmount || 0) > 0 ||
+                          (parsed.ipiDevolAmount || 0) > 0) && (
+                          <div className="col-span-2 sm:col-span-4 text-[11px] text-slate-600 flex flex-wrap gap-3 pt-1">
+                            {(parsed.icmsDesonAmount || 0) > 0 && (
+                              <span>
+                                ICMS Deson.:{' '}
+                                <strong className="font-mono text-slate-900">
+                                  {formatBRL(parsed.icmsDesonAmount)}
+                                </strong>{' '}
+                                ({parsed.icmsDesonDeducted ? 'deduzido no total' : 'informativo'})
+                              </span>
+                            )}
+                            {(parsed.fcpStAmount || 0) > 0 && (
+                              <span>
+                                FCP ST:{' '}
+                                <strong className="font-mono text-slate-900">
+                                  {formatBRL(parsed.fcpStAmount || 0)}
+                                </strong>
+                              </span>
+                            )}
+                            {(parsed.iiAmount || 0) > 0 && (
+                              <span>
+                                I. Importação:{' '}
+                                <strong className="font-mono text-slate-900">
+                                  {formatBRL(parsed.iiAmount || 0)}
+                                </strong>
+                              </span>
+                            )}
+                            {(parsed.ipiDevolAmount || 0) > 0 && (
+                              <span>
+                                IPI Devol.:{' '}
+                                <strong className="font-mono text-slate-900">
+                                  {formatBRL(parsed.ipiDevolAmount || 0)}
+                                </strong>
+                              </span>
+                            )}
+                          </div>
+                        )}
                     </>
                   )}
                   <div>
@@ -4598,16 +4768,34 @@ export function FiscalModule() {
                       </div>
                     </div>
 
-                    <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        disabled={!canEditActiveInvoice || editTaxRegime === 'mei'}
-                        checked={editIssqnRetained}
-                        onChange={(e) => setEditIssqnRetained(e.target.checked)}
-                        className="rounded border-slate-300"
-                      />
-                      ISSQN Retido na fonte (deduz do valor líquido; desmarque se for apenas ISSQN destacado)
-                    </label>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          disabled={!canEditActiveInvoice || editTaxRegime === 'mei'}
+                          checked={editIssqnRetained}
+                          onChange={(e) => setEditIssqnRetained(e.target.checked)}
+                          className="rounded border-slate-300"
+                        />
+                        ISSQN Retido na fonte (deduz do valor líquido; desmarque se for apenas ISSQN destacado)
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <label className="text-[11px] font-medium text-slate-600">
+                          Outras Retenções (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={!canEditActiveInvoice || editTaxRegime === 'mei'}
+                          value={editTaxRegime === 'mei' ? 0 : editRetainedTaxesAmount}
+                          onChange={(e) =>
+                            setEditRetainedTaxesAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-28 px-2.5 py-1 text-xs font-mono border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
+                    </div>
                   </div>
                 ) : (
                   <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5 tabular-nums">
@@ -4715,6 +4903,70 @@ export function FiscalModule() {
                         className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
                       />
                     </div>
+                    {(activeInvoice.docType || 'NFE') === 'NFE' && (
+                      <>
+                        <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                          <label className="text-[11px] font-medium text-slate-600 block mb-1">
+                            FCP ST (R$)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.01"
+                            disabled={!canEditActiveInvoice}
+                            value={editFcpStAmount}
+                            onChange={(e) =>
+                              setEditFcpStAmount(Math.max(0, Number(e.target.value)))
+                            }
+                            className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                          />
+                        </div>
+                        <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                          <label className="text-[11px] font-medium text-slate-600 block mb-1">
+                            I. Importação (R$)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.01"
+                            disabled={!canEditActiveInvoice}
+                            value={editIiAmount}
+                            onChange={(e) =>
+                              setEditIiAmount(Math.max(0, Number(e.target.value)))
+                            }
+                            className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                          />
+                        </div>
+                        <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                          <label className="text-[11px] font-medium text-slate-600 block mb-1">
+                            IPI Devol. (R$)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.01"
+                            disabled={!canEditActiveInvoice}
+                            value={editIpiDevolAmount}
+                            onChange={(e) =>
+                              setEditIpiDevolAmount(Math.max(0, Number(e.target.value)))
+                            }
+                            className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                          />
+                        </div>
+                        <div className="col-span-2 sm:col-span-4 lg:col-span-4 flex items-center px-1">
+                          <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              disabled={!canEditActiveInvoice}
+                              checked={editIcmsDesonDeducted}
+                              onChange={(e) => setEditIcmsDesonDeducted(e.target.checked)}
+                              className="rounded border-slate-300"
+                            />
+                            Deduzir ICMS Desonerado do valor líquido (conforme vNF do XML)
+                          </label>
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
 
@@ -6507,16 +6759,34 @@ export function FiscalModule() {
                         />
                       </div>
                     </div>
-                    <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        disabled={manualTaxRegime === 'mei'}
-                        checked={manualIssqnRetained}
-                        onChange={(e) => setManualIssqnRetained(e.target.checked)}
-                        className="rounded border-slate-300"
-                      />
-                      ISSQN Retido na fonte (deduz do valor líquido; desmarque se for apenas ISSQN destacado)
-                    </label>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          disabled={manualTaxRegime === 'mei'}
+                          checked={manualIssqnRetained}
+                          onChange={(e) => setManualIssqnRetained(e.target.checked)}
+                          className="rounded border-slate-300"
+                        />
+                        ISSQN Retido na fonte (deduz do valor líquido; desmarque se for apenas ISSQN destacado)
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs font-medium text-slate-700">
+                          Outras Retenções (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={manualTaxRegime === 'mei'}
+                          value={manualTaxRegime === 'mei' ? 0 : manualRetainedTaxesAmount}
+                          onChange={(e) =>
+                            setManualRetainedTaxesAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-28 px-2.5 py-1.5 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
+                    </div>
                   </div>
                 ) : (
                   <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
@@ -6619,6 +6889,66 @@ export function FiscalModule() {
                         className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
                       />
                     </div>
+                    {manualDocType === 'NFE' && (
+                      <>
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1">
+                            FCP ST (R$)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.01"
+                            value={manualFcpStAmount}
+                            onChange={(e) =>
+                              setManualFcpStAmount(Math.max(0, Number(e.target.value)))
+                            }
+                            className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1">
+                            I. Importação (R$)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.01"
+                            value={manualIiAmount}
+                            onChange={(e) =>
+                              setManualIiAmount(Math.max(0, Number(e.target.value)))
+                            }
+                            className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 mb-1">
+                            IPI Devol. (R$)
+                          </label>
+                          <input
+                            type="number"
+                            min={0}
+                            step="0.01"
+                            value={manualIpiDevolAmount}
+                            onChange={(e) =>
+                              setManualIpiDevolAmount(Math.max(0, Number(e.target.value)))
+                            }
+                            className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
+                          />
+                        </div>
+                        <div className="col-span-2 sm:col-span-4 lg:col-span-4 flex items-center pt-1">
+                          <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={manualIcmsDesonDeducted}
+                              onChange={(e) => setManualIcmsDesonDeducted(e.target.checked)}
+                              className="rounded border-slate-300"
+                            />
+                            Deduzir ICMS Desonerado do valor líquido
+                          </label>
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
 

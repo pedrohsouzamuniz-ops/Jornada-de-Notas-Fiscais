@@ -448,10 +448,22 @@
         "icmsDesonAmount": {
           "type": "number"
         },
+        "icmsDesonDeducted": {
+          "type": "boolean"
+        },
         "icmsStAmount": {
           "type": "number"
         },
+        "fcpStAmount": {
+          "type": "number"
+        },
+        "iiAmount": {
+          "type": "number"
+        },
         "ipiAmount": {
+          "type": "number"
+        },
+        "ipiDevolAmount": {
           "type": "number"
         },
         "pisAmount": {

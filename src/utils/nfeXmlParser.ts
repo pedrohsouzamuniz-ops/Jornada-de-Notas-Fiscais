@@ -6,7 +6,11 @@ import {
   ServiceTaxRegime,
 } from '../types/p2p';
 import { getUfFromCodeOrAccessKey } from './brazilLocations';
-import { calculateFiscalNetTotal, roundMoney } from './fiscalCalculations';
+import {
+  calculateFiscalNetTotal,
+  resolveEffectiveIcmsDesonDeducted,
+  roundMoney,
+} from './fiscalCalculations';
 import { formatCnpj, sanitizeText, todayISO } from './formatters';
 import { isValidGtin } from './itemReconciliation';
 
@@ -29,8 +33,12 @@ export interface ParsedFiscalXml {
   totalProducts: number;
   icmsAmount: number;
   icmsDesonAmount: number;
+  icmsDesonDeducted?: boolean;
   icmsStAmount: number;
+  fcpStAmount?: number;
+  iiAmount?: number;
   ipiAmount: number;
+  ipiDevolAmount?: number;
   pisAmount: number;
   cofinsAmount: number;
   csllAmount: number;
@@ -139,10 +147,12 @@ export function parseFiscalXml(xmlContent: string): ParsedFiscalXml {
 function parseNFe(doc: Document, infNFe: Element): ParsedFiscalXml {
   const ide = getElementsByLocalName(infNFe, 'ide')[0] || null;
   const emit = getElementsByLocalName(infNFe, 'emit')[0] || null;
+  const totalEl = getElementsByLocalName(infNFe, 'total')[0] || null;
   const total =
     getElementsByLocalName(infNFe, 'ICMSTot')[0] ||
-    getElementsByLocalName(infNFe, 'total')[0] ||
+    totalEl ||
     null;
+  const issqnTot = totalEl ? getElementsByLocalName(totalEl, 'ISSQNtot')[0] || null : null;
   const protNFe = getElementsByLocalName(doc, 'protNFe')[0] || null;
 
   let accessKey = getTagText(protNFe, 'chNFe').replace(/\D/g, '');
@@ -205,26 +215,95 @@ function parseNFe(doc: Document, infNFe: Element): ParsedFiscalXml {
 
   const mainCfop = sanitizeText(items[0]?.cfop || '5102', 16);
   const sumItems = items.reduce((acc, item) => acc + item.totalPrice, 0);
-  const totalProducts = roundMoney(getTagNumber(total, 'vProd') || sumItems);
-  const freightAmount = roundMoney(getTagNumber(total, 'vFrete'));
-  const insuranceAmount = roundMoney(getTagNumber(total, 'vSeg'));
-  const otherExpensesAmount = roundMoney(getTagNumber(total, 'vOutro'));
+  const vProdTag = getTagNumber(total, 'vProd');
+  const vServNfe = issqnTot ? getTagNumber(issqnTot, 'vServ') : 0;
+  const totalProducts = roundMoney(vProdTag > 0 ? vProdTag + vServNfe : sumItems);
+  const freightAmount = roundMoney(
+    getTagNumber(total, 'vFrete') ||
+      detNodes.reduce((acc, det) => acc + getTagNumber(det, 'vFrete'), 0)
+  );
+  const insuranceAmount = roundMoney(
+    getTagNumber(total, 'vSeg') ||
+      detNodes.reduce((acc, det) => acc + getTagNumber(det, 'vSeg'), 0)
+  );
+  const otherExpensesAmount = roundMoney(
+    getTagNumber(total, 'vOutro') ||
+      detNodes.reduce((acc, det) => acc + getTagNumber(det, 'vOutro'), 0)
+  );
   const surchargeAmount = 0;
-  const discountAmount = roundMoney(getTagNumber(total, 'vDesc'));
+  const issqnDesc = issqnTot
+    ? roundMoney(getTagNumber(issqnTot, 'vDescIncond') + getTagNumber(issqnTot, 'vDescCond'))
+    : 0;
+  const discountAmount = roundMoney(
+    (getTagNumber(total, 'vDesc') ||
+      detNodes.reduce((acc, det) => acc + getTagNumber(det, 'vDesc'), 0)) + issqnDesc
+  );
   const icmsAmount = roundMoney(getTagNumber(total, 'vICMS'));
+
   let icmsDesonAmount = roundMoney(getTagNumber(total, 'vICMSDeson'));
   if (icmsDesonAmount === 0) {
     icmsDesonAmount = roundMoney(
       detNodes.reduce((acc, det) => acc + getTagNumber(det, 'vICMSDeson'), 0)
     );
   }
+  let hasExplicitIndOne = false;
+  let hasExplicitIndZero = false;
+  let deductedDesonSum = 0;
+  detNodes.forEach((det) => {
+    const icmsNode = getElementsByLocalName(det, 'ICMS')[0] || det;
+    const ind = getTagText(icmsNode, 'indDeduzDeson').trim();
+    const val = getTagNumber(icmsNode, 'vICMSDeson');
+    if (ind === '1') {
+      hasExplicitIndOne = true;
+      deductedDesonSum += val;
+    } else if (ind === '0') {
+      hasExplicitIndZero = true;
+    }
+  });
+  if (hasExplicitIndOne && hasExplicitIndZero && deductedDesonSum > 0) {
+    icmsDesonAmount = roundMoney(deductedDesonSum);
+  }
+
   let icmsStAmount = roundMoney(getTagNumber(total, 'vST'));
   if (icmsStAmount === 0) {
     icmsStAmount = roundMoney(
       detNodes.reduce((acc, det) => acc + getTagNumber(det, 'vICMSST'), 0)
     );
   }
-  const ipiAmount = roundMoney(getTagNumber(total, 'vIPI'));
+  let fcpStAmount = roundMoney(getTagNumber(total, 'vFCPST'));
+  if (fcpStAmount === 0) {
+    fcpStAmount = roundMoney(
+      detNodes.reduce((acc, det) => acc + getTagNumber(det, 'vFCPST'), 0)
+    );
+  }
+  let iiAmount = roundMoney(getTagNumber(total, 'vII'));
+  if (iiAmount === 0) {
+    iiAmount = roundMoney(
+      detNodes.reduce((acc, det) => {
+        const iiNode = getElementsByLocalName(det, 'II')[0];
+        return acc + (iiNode ? getTagNumber(iiNode, 'vII') : 0);
+      }, 0)
+    );
+  }
+  let ipiAmount = roundMoney(getTagNumber(total, 'vIPI'));
+  if (ipiAmount === 0) {
+    ipiAmount = roundMoney(
+      detNodes.reduce((acc, det) => {
+        const ipiNode = getElementsByLocalName(det, 'IPI')[0];
+        return acc + (ipiNode ? getTagNumber(ipiNode, 'vIPI') : 0);
+      }, 0)
+    );
+  }
+  let ipiDevolAmount = roundMoney(getTagNumber(total, 'vIPIDevol'));
+  if (ipiDevolAmount === 0) {
+    ipiDevolAmount = roundMoney(
+      detNodes.reduce((acc, det) => {
+        const devNode = getElementsByLocalName(det, 'impostoDevol')[0];
+        return acc + (devNode ? getTagNumber(devNode, 'vIPIDevol') : 0);
+      }, 0)
+    );
+  }
+
   const pisAmount = roundMoney(getTagNumber(total, 'vPIS'));
   const cofinsAmount = roundMoney(getTagNumber(total, 'vCOFINS'));
 
@@ -236,9 +315,50 @@ function parseNFe(doc: Document, infNFe: Element): ParsedFiscalXml {
   const retainedTaxesAmount = retTrib
     ? roundMoney(getTagNumber(retTrib, 'vRetPIS') + getTagNumber(retTrib, 'vRetCOFINS'))
     : 0;
+  const issRetNfe = issqnTot ? roundMoney(getTagNumber(issqnTot, 'vISSRet')) : 0;
 
   const vnfDeclared = getTagNumber(total, 'vNF');
   const xmlDeclaredTotal = vnfDeclared > 0 ? roundMoney(vnfDeclared) : undefined;
+
+  const totalWithoutDeson = calculateFiscalNetTotal({
+    docType: 'NFE',
+    totalProducts,
+    freightAmount,
+    insuranceAmount,
+    otherExpensesAmount,
+    surchargeAmount,
+    ipiAmount,
+    ipiDevolAmount,
+    icmsStAmount,
+    fcpStAmount,
+    iiAmount,
+    icmsDesonAmount: 0,
+    icmsDesonDeducted: false,
+    discountAmount,
+    csllAmount,
+    issqnAmount: issRetNfe,
+    issqnRetained: issRetNfe > 0,
+    inssAmount,
+    irrfAmount,
+    retainedTaxesAmount,
+  });
+
+  const explicitDesonFlag =
+    icmsDesonAmount <= 0
+      ? false
+      : hasExplicitIndOne
+      ? true
+      : hasExplicitIndZero
+      ? false
+      : undefined;
+
+  const icmsDesonDeducted = resolveEffectiveIcmsDesonDeducted({
+    docType: 'NFE',
+    icmsDesonAmount,
+    icmsDesonDeducted: explicitDesonFlag,
+    xmlDeclaredTotal,
+    totalWithoutDeson,
+  });
 
   const totalInvoice = calculateFiscalNetTotal({
     docType: 'NFE',
@@ -248,9 +368,16 @@ function parseNFe(doc: Document, infNFe: Element): ParsedFiscalXml {
     otherExpensesAmount,
     surchargeAmount,
     ipiAmount,
+    ipiDevolAmount,
     icmsStAmount,
+    fcpStAmount,
+    iiAmount,
+    icmsDesonAmount,
+    icmsDesonDeducted,
     discountAmount,
     csllAmount,
+    issqnAmount: issRetNfe,
+    issqnRetained: issRetNfe > 0,
     inssAmount,
     irrfAmount,
     retainedTaxesAmount,
@@ -296,13 +423,17 @@ function parseNFe(doc: Document, infNFe: Element): ParsedFiscalXml {
     totalProducts,
     icmsAmount,
     icmsDesonAmount,
+    icmsDesonDeducted,
     icmsStAmount,
+    fcpStAmount,
+    iiAmount,
     ipiAmount,
+    ipiDevolAmount,
     pisAmount,
     cofinsAmount,
     csllAmount,
-    issqnAmount: 0,
-    issqnRetained: false,
+    issqnAmount: issRetNfe,
+    issqnRetained: issRetNfe > 0,
     inssAmount,
     irrfAmount,
     retainedTaxesAmount,
@@ -396,12 +527,17 @@ function parseNFSe(doc: Document, infNFSe: Element): ParsedFiscalXml {
     ])
   );
 
-  const rawPisAmount = getFirstPositiveTagNumber(taxScopes, ['vRetPIS', 'vPIS', 'ValorPis']);
-  const rawCofinsAmount = getFirstPositiveTagNumber(taxScopes, [
-    'vRetCOFINS',
-    'vCOFINS',
-    'ValorCofins',
-  ]);
+  const tpRetPisCofins = getTagText(tribFed || dps || infNFSe, 'tpRetPisCofins').trim();
+  const explicitRetPis = getFirstPositiveTagNumber(taxScopes, ['vRetPIS']);
+  const explicitRetCofins = getFirstPositiveTagNumber(taxScopes, ['vRetCOFINS']);
+  const rawPisAmount =
+    tpRetPisCofins === '2' && explicitRetPis === 0
+      ? 0
+      : getFirstPositiveTagNumber(taxScopes, ['vRetPIS', 'vPIS', 'ValorPis']);
+  const rawCofinsAmount =
+    tpRetPisCofins === '2' && explicitRetCofins === 0
+      ? 0
+      : getFirstPositiveTagNumber(taxScopes, ['vRetCOFINS', 'vCOFINS', 'ValorCofins']);
   const rawCsllAmount = getFirstPositiveTagNumber(taxScopes, ['vRetCSLL', 'vCSLL', 'ValorCsll']);
   const rawInssAmount = getFirstPositiveTagNumber(taxScopes, [
     'vRetINSS',
@@ -414,6 +550,10 @@ function parseNFSe(doc: Document, infNFSe: Element): ParsedFiscalXml {
     'vIRRF',
     'vIR',
     'ValorIr',
+  ]);
+  const rawOutrasRetencoes = getFirstPositiveTagNumber(taxScopes, [
+    'OutrasRetencoes',
+    'vOutrasRet',
   ]);
 
   // Consolidated federal retention tag (only fallback if individual federal withholdings are absent to prevent double counting!)
@@ -435,9 +575,15 @@ function parseNFSe(doc: Document, infNFSe: Element): ParsedFiscalXml {
   const tpRetISSQN = getTagText(tribMun || dps || infNFSe, 'tpRetISSQN').trim();
   const issRetidoAbrasf = getTagText(valores || infNFSe, 'IssRetido').trim();
 
-  const discountAmount = roundMoney(
-    getFirstPositiveTagNumber([valores, infNFSe, dps], ['vDescIncond', 'DescontoIncondicionado'])
-  );
+  const discountIncond = getFirstPositiveTagNumber([valores, infNFSe, dps], [
+    'vDescIncond',
+    'DescontoIncondicionado',
+  ]);
+  const discountCond = getFirstPositiveTagNumber([valores, infNFSe, dps], [
+    'vDescCond',
+    'DescontoCondicionado',
+  ]);
+  const discountAmount = roundMoney(discountIncond + discountCond);
   const otherExpensesAmount = roundMoney(
     getFirstPositiveTagNumber([valores, infNFSe, dps], ['vOutro', 'OutrasDespesas'])
   );
@@ -477,7 +623,7 @@ function parseNFSe(doc: Document, infNFSe: Element): ParsedFiscalXml {
     rawConsolidatedFed > 0
   ) {
     taxRegime = 'regime_normal';
-  } else if (rawIssqnAmount > 0 || rawInssAmount > 0) {
+  } else if (rawIssqnAmount > 0 || rawInssAmount > 0 || rawOutrasRetencoes > 0) {
     taxRegime = 'simples_nacional';
   }
 
@@ -487,7 +633,12 @@ function parseNFSe(doc: Document, infNFSe: Element): ParsedFiscalXml {
   const issqnAmount = taxRegime === 'mei' ? 0 : rawIssqnAmount;
   const inssAmount = taxRegime === 'mei' ? 0 : rawInssAmount;
   const irrfAmount = taxRegime === 'regime_normal' ? rawIrrfAmount : 0;
-  const retainedTaxesAmount = taxRegime === 'regime_normal' ? rawConsolidatedFed : 0;
+  const retainedTaxesAmount =
+    taxRegime === 'mei'
+      ? 0
+      : roundMoney(
+          (taxRegime === 'regime_normal' ? rawConsolidatedFed : 0) + rawOutrasRetencoes
+        );
 
   // Distinguish highlighted ISSQN (prestador recolhe) vs retained ISSQN (tomador retém e deduz do líquido)
   let issqnRetained = issqnAmount > 0;

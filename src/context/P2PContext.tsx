@@ -1223,13 +1223,33 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
       docType === 'NFSE'
         ? 0
         : roundMoney(Math.max(0, Number(data.icmsDesonAmount ?? existing.icmsDesonAmount ?? 0)));
+    const icmsDesonDeducted =
+      docType === 'NFE'
+        ? typeof data.icmsDesonDeducted === 'boolean'
+          ? data.icmsDesonDeducted
+          : typeof existing.icmsDesonDeducted === 'boolean'
+          ? existing.icmsDesonDeducted
+          : icmsDesonAmount > 0
+        : false;
     const icmsStAmount =
       docType === 'NFE'
         ? roundMoney(Math.max(0, Number(data.icmsStAmount ?? existing.icmsStAmount ?? 0)))
         : 0;
+    const fcpStAmount =
+      docType === 'NFE'
+        ? roundMoney(Math.max(0, Number(data.fcpStAmount ?? existing.fcpStAmount ?? 0)))
+        : 0;
+    const iiAmount =
+      docType === 'NFE'
+        ? roundMoney(Math.max(0, Number(data.iiAmount ?? existing.iiAmount ?? 0)))
+        : 0;
     const ipiAmount =
       docType === 'NFE'
         ? roundMoney(Math.max(0, Number(data.ipiAmount ?? existing.ipiAmount ?? 0)))
+        : 0;
+    const ipiDevolAmount =
+      docType === 'NFE'
+        ? roundMoney(Math.max(0, Number(data.ipiDevolAmount ?? existing.ipiDevolAmount ?? 0)))
         : 0;
     const taxRegime = docType === 'NFSE' ? (data.taxRegime ?? existing.taxRegime ?? 'simples_nacional') : '';
     const pisAmount = roundMoney(Math.max(0, Number(data.pisAmount ?? existing.pisAmount ?? 0)));
@@ -1253,7 +1273,12 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
       otherExpensesAmount,
       surchargeAmount,
       ipiAmount,
+      ipiDevolAmount,
       icmsStAmount,
+      fcpStAmount,
+      iiAmount,
+      icmsDesonAmount,
+      icmsDesonDeducted,
       discountAmount,
       retainedTaxesAmount,
       taxRegime,
@@ -1307,7 +1332,12 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
         surchargeAmount,
         discountAmount,
         ipiAmount,
+        ipiDevolAmount,
         icmsStAmount,
+        fcpStAmount,
+        iiAmount,
+        icmsDesonAmount,
+        icmsDesonDeducted,
         pisAmount,
         cofinsAmount,
         csllAmount,
@@ -1374,8 +1404,17 @@ export function P2PProvider({ children }: { children: React.ReactNode }) {
       totalProducts,
       icmsAmount,
       icmsDesonAmount,
+      ...(docType === 'NFE' &&
+      (icmsDesonAmount > 0 ||
+        typeof data.icmsDesonDeducted === 'boolean' ||
+        typeof existing.icmsDesonDeducted === 'boolean')
+        ? { icmsDesonDeducted }
+        : {}),
       icmsStAmount,
+      ...(fcpStAmount > 0 || existing.fcpStAmount !== undefined ? { fcpStAmount } : {}),
+      ...(iiAmount > 0 || existing.iiAmount !== undefined ? { iiAmount } : {}),
       ipiAmount,
+      ...(ipiDevolAmount > 0 || existing.ipiDevolAmount !== undefined ? { ipiDevolAmount } : {}),
       taxRegime,
       pisAmount,
       cofinsAmount,

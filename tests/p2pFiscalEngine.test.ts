@@ -3,6 +3,7 @@ import {
   calculateFiscalNetTotal,
   comparePurchaseOrderAndInvoice,
   getEffectiveRetainedTaxes,
+  resolveEffectiveIcmsDesonDeducted,
 } from '../src/utils/fiscalCalculations';
 import {
   buildDeterministicItemAssociations,
@@ -654,6 +655,54 @@ test('shouldShowPoInReceivingList hides POs linked only to dispensed invoices an
     false,
     'Cancelled PO must remain hidden'
   );
+});
+
+// 8. NF-e Tax Additions & Reductions (ICMS Desonerado, FCP-ST, II, IPI Devol.)
+test('calculateFiscalNetTotal and resolveEffectiveIcmsDesonDeducted handle NF-e tax additions and ICMS Desonerado reduction accurately', () => {
+  // User case: vProd = 6895.63, vICMSDeson = 1379.13, vNF = 5516.50
+  const deduced = resolveEffectiveIcmsDesonDeducted({
+    docType: 'NFE',
+    icmsDesonAmount: 1379.13,
+    xmlDeclaredTotal: 5516.5,
+    totalWithoutDeson: 6895.63,
+  });
+  assertEqual(deduced, true, 'Must detect ICMS Desonerado deducted from vNF');
+
+  const netWithDeson = calculateFiscalNetTotal({
+    docType: 'NFE',
+    totalProducts: 6895.63,
+    icmsDesonAmount: 1379.13,
+    icmsDesonDeducted: deduced,
+  });
+  assertEqual(netWithDeson, 5516.5, 'NF-e net total must match XML vNF R$ 5.516,50');
+
+  // Informative ICMS Deson. (not deducted from vNF)
+  const informativeDeson = resolveEffectiveIcmsDesonDeducted({
+    docType: 'NFE',
+    icmsDesonAmount: 494,
+    xmlDeclaredTotal: 13217.5,
+    totalWithoutDeson: 13217.5,
+  });
+  assertEqual(informativeDeson, false, 'Informative ICMS Deson. must not be deducted from vNF');
+
+  // Additions: FCP-ST + II + IPI Devol. + IPI + ICMS-ST + Freight + Insurance + Other - Discount - ICMS Deson.
+  const fullNfeNet = calculateFiscalNetTotal({
+    docType: 'NFE',
+    totalProducts: 1000,
+    freightAmount: 50,
+    insuranceAmount: 10,
+    otherExpensesAmount: 20,
+    ipiAmount: 40,
+    ipiDevolAmount: 15,
+    icmsStAmount: 25,
+    fcpStAmount: 5,
+    iiAmount: 80,
+    discountAmount: 10,
+    icmsDesonAmount: 100,
+    icmsDesonDeducted: true,
+  });
+  // 1000 + 50 + 10 + 20 + 40 + 15 + 25 + 5 + 80 - 10 - 100 = 1135
+  assertEqual(fullNfeNet, 1135, 'NF-e net total includes FCP-ST, II, IPI Devol. and deducts ICMS Deson.');
 });
 
 console.log(`\nAll ${passed} P2P Fiscal Engine tests passed!`);

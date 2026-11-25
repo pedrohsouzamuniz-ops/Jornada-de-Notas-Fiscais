@@ -49,10 +49,22 @@ export function buildFiscalInvoiceCreatePayload(
     data.docType === 'NFSE' ? 0 : roundMoney(Math.max(0, Number(data.icmsAmount || 0)));
   const icmsDesonAmount =
     data.docType === 'NFSE' ? 0 : roundMoney(Math.max(0, Number(data.icmsDesonAmount ?? 0)));
+  const icmsDesonDeducted =
+    data.docType === 'NFE'
+      ? typeof data.icmsDesonDeducted === 'boolean'
+        ? data.icmsDesonDeducted
+        : icmsDesonAmount > 0
+      : false;
   const icmsStAmount =
     data.docType === 'NFE' ? roundMoney(Math.max(0, Number(data.icmsStAmount ?? 0))) : 0;
+  const fcpStAmount =
+    data.docType === 'NFE' ? roundMoney(Math.max(0, Number(data.fcpStAmount ?? 0))) : 0;
+  const iiAmount =
+    data.docType === 'NFE' ? roundMoney(Math.max(0, Number(data.iiAmount ?? 0))) : 0;
   const ipiAmount =
     data.docType === 'NFE' ? roundMoney(Math.max(0, Number(data.ipiAmount || 0))) : 0;
+  const ipiDevolAmount =
+    data.docType === 'NFE' ? roundMoney(Math.max(0, Number(data.ipiDevolAmount ?? 0))) : 0;
   const taxRegime = data.docType === 'NFSE' ? data.taxRegime || 'simples_nacional' : '';
   const pisAmount = roundMoney(Math.max(0, Number(data.pisAmount || 0)));
   const cofinsAmount = roundMoney(Math.max(0, Number(data.cofinsAmount || 0)));
@@ -71,7 +83,12 @@ export function buildFiscalInvoiceCreatePayload(
     otherExpensesAmount,
     surchargeAmount,
     ipiAmount,
+    ipiDevolAmount,
     icmsStAmount,
+    fcpStAmount,
+    iiAmount,
+    icmsDesonAmount,
+    icmsDesonDeducted,
     discountAmount,
     retainedTaxesAmount,
     taxRegime,
@@ -113,8 +130,14 @@ export function buildFiscalInvoiceCreatePayload(
     totalProducts,
     icmsAmount,
     icmsDesonAmount,
+    ...(data.docType === 'NFE' && (icmsDesonAmount > 0 || typeof data.icmsDesonDeducted === 'boolean')
+      ? { icmsDesonDeducted }
+      : {}),
     icmsStAmount,
+    ...(fcpStAmount > 0 ? { fcpStAmount } : {}),
+    ...(iiAmount > 0 ? { iiAmount } : {}),
     ipiAmount,
+    ...(ipiDevolAmount > 0 ? { ipiDevolAmount } : {}),
     pisAmount,
     cofinsAmount,
     csllAmount,

@@ -960,6 +960,44 @@ async function main() {
     );
   });
 
+  await runCase('8. Fiscal can create NF-e with ICMS Desonerado deducted and FCP-ST / II / IPI Devol.', async () => {
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(doc(ctx.firestore(), 'sector_permissions', 'fiscal'), {
+        sector: 'fiscal',
+        canCreate: true,
+        canEdit: true,
+        canDelete: true,
+        canViewOtherSectors: true,
+        updatedByUid: 'admin_uid',
+        updatedAt: Timestamp.now(),
+      });
+    });
+
+    const db = fiscalCtx.firestore();
+    const invId = generateDocId('nfe');
+    const payload = buildFiscalInvoiceCreatePayload(
+      baseManualNfe({
+        accessKey: `NFE-TAXES-${Date.now()}`,
+        totalProducts: 6895.63,
+        grossAmount: 6895.63,
+        icmsDesonAmount: 1379.13,
+        icmsDesonDeducted: true,
+        fcpStAmount: 12.5,
+        iiAmount: 25.0,
+        ipiDevolAmount: 10.0,
+        xmlDeclaredTotal: 5564.0,
+      }),
+      'fiscal_uid',
+      'Analista Fiscal'
+    );
+    await assertSucceeds(setDoc(doc(db, 'fiscal_invoices', invId), payload));
+    const snap = await getDoc(doc(db, 'fiscal_invoices', invId));
+    const saved = snap.data() as FiscalInvoice;
+    if (Math.abs(saved.totalInvoice - 5564.0) > 0.01) {
+      throw new Error(`Expected totalInvoice 5564.0, got ${saved.totalInvoice}`);
+    }
+  });
+
   await testEnv.cleanup();
   console.log(`\nALL EMULATOR TESTS PASSED (${passed}/${passed})`);
 }
