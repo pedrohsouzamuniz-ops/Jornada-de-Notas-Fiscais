@@ -665,3 +665,30 @@ export function getPoReceptionSummary(
     linkedReceipts,
   };
 }
+
+export function shouldShowPoInReceivingList(
+  po: Pick<PurchaseOrder, 'id' | 'status'>,
+  fiscalInvoices: Array<
+    Pick<FiscalInvoice, 'purchaseOrderId' | 'fiscalStatus' | 'requiresPhysicalReceipt'>
+  >
+): boolean {
+  if (po.status === 'cancelado') return false;
+  const linkedInvoices = fiscalInvoices.filter(
+    (inv) =>
+      inv.purchaseOrderId === po.id &&
+      inv.fiscalStatus !== 'substituida' &&
+      inv.fiscalStatus !== 'rejeitada'
+  );
+  const hasDispensedInvoice = linkedInvoices.some(
+    (inv) => inv.requiresPhysicalReceipt === false
+  );
+  const hasInvoiceAwaitingPhysicalReceipt = linkedInvoices.some(
+    (inv) =>
+      inv.fiscalStatus === 'aguardando_recebimento' &&
+      (inv.requiresPhysicalReceipt ?? true)
+  );
+  if (hasDispensedInvoice && !hasInvoiceAwaitingPhysicalReceipt) {
+    return false;
+  }
+  return true;
+}

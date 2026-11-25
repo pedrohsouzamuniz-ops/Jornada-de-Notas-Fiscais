@@ -25,7 +25,11 @@ import {
   normalizeCnpjDigits,
   todayISO,
 } from '../utils/formatters';
-import { evaluateThreeWayMatch, getPoReceptionSummary } from '../utils/matching';
+import {
+  evaluateThreeWayMatch,
+  getPoReceptionSummary,
+  shouldShowPoInReceivingList,
+} from '../utils/matching';
 import { DeleteAuthModal } from './DeleteAuthModal';
 import { StatusTag } from './StatusBadge';
 
@@ -79,7 +83,7 @@ export function RecebimentoModule() {
   const filteredPos = useMemo(() => {
     const q = poSearch.trim().toLowerCase();
     return purchaseOrders.filter((po) => {
-      if (po.status === 'cancelado') return false;
+      if (!shouldShowPoInReceivingList(po, fiscalInvoices)) return false;
       if (poStatusFilter === 'ativos' && po.status === 'concluido') return false;
       if (poStatusFilter === 'concluido' && po.status !== 'concluido') return false;
       if (!q) return true;
@@ -89,7 +93,7 @@ export function RecebimentoModule() {
         po.supplierCnpj.toLowerCase().includes(q)
       );
     });
-  }, [purchaseOrders, poSearch, poStatusFilter]);
+  }, [purchaseOrders, fiscalInvoices, poSearch, poStatusFilter]);
 
   const filteredReceipts = useMemo(() => {
     const q = receiptSearch.trim().toLowerCase();

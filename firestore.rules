@@ -11,7 +11,7 @@ service cloud.firestore {
     // Primitive Helpers
     // -------------------------------------------------------------------------
     function isValidId(id) {
-      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.matches('^[a-zA-Z0-9_\\-]{1,128}$');
     }
 
     function incoming() {
@@ -34,11 +34,13 @@ service cloud.firestore {
       return isVerified() && request.auth.uid == uid;
     }
 
+    function isAdminClaim() {
+      return exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email.lower() == 'pedrohsouzamuniz@gmail.com';
+    }
+
     function isAdmin() {
-      return isVerified() && (
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
-        request.auth.token.email.lower() == 'pedrohsouzamuniz@gmail.com'
-      );
+      return isVerified() && isAdminClaim();
     }
 
     function userDocExists() {
@@ -49,10 +51,12 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
     }
 
+    function isUserRoleActive(u, roleName) {
+      return u.status == 'ativo' && u.role == roleName;
+    }
+
     function hasSectorRole(roleName) {
-      return isVerified() && userDocExists() &&
-        userData().status == 'ativo' &&
-        userData().role == roleName;
+      return isVerified() && userDocExists() && isUserRoleActive(userData(), roleName);
     }
 
     function sectorAllows(sectorName, permKey) {
@@ -79,11 +83,11 @@ service cloud.firestore {
     }
 
     function isValidDateStr(val) {
-      return val is string && val.size() == 10 && val.matches('^\\d{4}-\\d{2}-\\d{2}$');
+      return val is string && val.matches('^\\d{4}-\\d{2}-\\d{2}$');
     }
 
     function isValidOptionalDateStr(val) {
-      return val is string && (val == '' || (val.size() == 10 && val.matches('^\\d{4}-\\d{2}-\\d{2}$')));
+      return val is string && val.matches('^(\\d{4}-\\d{2}-\\d{2})?$');
     }
 
     // -------------------------------------------------------------------------
@@ -210,14 +214,7 @@ service cloud.firestore {
     }
 
     function isValidFiscalInvoice(data) {
-      return data.keys().hasAll([
-          'docType', 'accessKey', 'nfeNumber', 'series', 'issuerName', 'issuerCnpj', 'issueDate', 'cfop',
-          'grossAmount', 'freightAmount', 'totalProducts', 'icmsAmount', 'ipiAmount', 'pisAmount', 'cofinsAmount', 'totalInvoice',
-          'items', 'purchaseOrderId', 'poNumber', 'receiptId', 'receiptNumber', 'matchingStatus',
-          'fiscalStatus', 'bookkeepingDate', 'xmlImported', 'notes',
-          'createdByUid', 'createdByName', 'createdAt', 'updatedAt'
-        ]) &&
-        data.keys().hasOnly([
+      return data.keys().hasOnly([
           'docType', 'accessKey', 'nfeNumber', 'series', 'issuerName', 'issuerCnpj', 'issuerState', 'issueDate', 'cfop',
           'grossAmount', 'freightAmount', 'insuranceAmount', 'otherExpensesAmount', 'surchargeAmount', 'discountAmount',
           'totalProducts', 'icmsAmount', 'icmsDesonAmount', 'icmsStAmount',
@@ -239,25 +236,16 @@ service cloud.firestore {
         validFiscalAmounts(data) &&
         validFiscalItems(data) &&
         validFiscalLinks(data) &&
-        validFiscalTransport(data) &&
         validFiscalStatus(data) &&
         validFiscalConference(data) &&
         validFiscalNotes(data) &&
         validFiscalAudit(data) &&
         'requiresPhysicalReceipt' in data &&
-        data.requiresPhysicalReceipt is bool &&
         (data.fiscalStatus != 'aguardando_recebimento' || data.requiresPhysicalReceipt == true);
     }
 
     function validFiscalSchema(data) {
-      return data.keys().hasAll([
-          'docType', 'accessKey', 'nfeNumber', 'series', 'issuerName', 'issuerCnpj', 'issueDate', 'cfop',
-          'grossAmount', 'freightAmount', 'totalProducts', 'icmsAmount', 'ipiAmount', 'pisAmount', 'cofinsAmount', 'totalInvoice',
-          'items', 'purchaseOrderId', 'poNumber', 'receiptId', 'receiptNumber', 'matchingStatus',
-          'fiscalStatus', 'bookkeepingDate', 'xmlImported', 'notes',
-          'createdByUid', 'createdByName', 'createdAt', 'updatedAt'
-        ]) &&
-        data.keys().hasOnly([
+      return data.keys().hasOnly([
           'docType', 'accessKey', 'nfeNumber', 'series', 'issuerName', 'issuerCnpj', 'issuerState', 'issueDate', 'cfop',
           'grossAmount', 'freightAmount', 'insuranceAmount', 'otherExpensesAmount', 'surchargeAmount', 'discountAmount',
           'totalProducts', 'icmsAmount', 'icmsDesonAmount', 'icmsStAmount',
@@ -279,129 +267,96 @@ service cloud.firestore {
 
     function validFiscalIdentity(data) {
       return data.docType in ['NFE', 'NFSE', 'CTE'] &&
-        data.accessKey is string && data.accessKey.matches('(?s)^.{8,64}$') && data.accessKey.matches('^[a-zA-Z0-9_\\-]+$') &&
-        data.nfeNumber is string && data.nfeNumber.matches('(?s)^.{1,20}$') &&
-        (data.series is string &&
-          (data.docType == 'NFSE'
-            ? data.series.matches('(?s)^.{0,10}$')
-            : data.series.matches('(?s)^.{1,10}$'))) &&
-        data.issuerName is string && data.issuerName.matches('(?s)^.{1,160}$') &&
-        data.issuerCnpj is string && data.issuerCnpj.matches('(?s)^.{11,20}$') &&
-        (data.get('issuerState', '').matches('(?s)^.{0,2}$')) &&
+        data.accessKey is string && data.accessKey.matches('^[a-zA-Z0-9_\\-]{8,64}$') &&
+        data.nfeNumber is string && data.nfeNumber != '' && data.nfeNumber.size() <= 20 &&
+        data.series is string && data.series.size() <= 10 && (data.docType == 'NFSE' || data.series != '') &&
+        data.issuerName is string && data.issuerName != '' && data.issuerName.size() <= 160 &&
+        data.issuerCnpj is string && data.issuerCnpj.size() >= 11 && data.issuerCnpj.size() <= 20 &&
         isValidDateStr(data.issueDate) &&
-        data.cfop is string && data.cfop.matches('(?s)^.{1,16}$');
+        data.cfop is string && data.cfop != '' && data.cfop.size() <= 16;
     }
 
     function validFiscalAmounts(data) {
-      return data.grossAmount is number && data.grossAmount >= 0 &&
-        data.freightAmount is number && data.freightAmount >= 0 &&
-        (data.get('insuranceAmount', 0) is number && data.get('insuranceAmount', 0) >= 0) &&
-        (data.get('otherExpensesAmount', 0) is number && data.get('otherExpensesAmount', 0) >= 0) &&
-        (data.get('surchargeAmount', 0) is number && data.get('surchargeAmount', 0) >= 0) &&
-        (data.get('discountAmount', 0) is number && data.get('discountAmount', 0) >= 0) &&
-        data.totalProducts is number && data.totalProducts >= 0 &&
-        data.icmsAmount is number && data.icmsAmount >= 0 &&
-        (data.get('icmsDesonAmount', 0) is number && data.get('icmsDesonAmount', 0) >= 0) &&
-        (data.get('icmsStAmount', 0) is number && data.get('icmsStAmount', 0) >= 0) &&
-        data.ipiAmount is number && data.ipiAmount >= 0 &&
-        data.pisAmount is number && data.pisAmount >= 0 &&
-        data.cofinsAmount is number && data.cofinsAmount >= 0 &&
-        (data.get('csllAmount', 0) is number && data.get('csllAmount', 0) >= 0) &&
-        (data.get('issqnAmount', 0) is number && data.get('issqnAmount', 0) >= 0) &&
-        (!('issqnRetained' in data) || data.issqnRetained is bool) &&
-        (data.get('inssAmount', 0) is number && data.get('inssAmount', 0) >= 0) &&
-        (data.get('irrfAmount', 0) is number && data.get('irrfAmount', 0) >= 0) &&
-        (data.get('retainedTaxesAmount', 0) is number && data.get('retainedTaxesAmount', 0) >= 0) &&
-        (!('taxRegime' in data) || data.taxRegime in ['', 'mei', 'simples_nacional', 'regime_normal']) &&
-        data.totalInvoice is number && data.totalInvoice >= 0 &&
-        (!('xmlDeclaredTotal' in data) || (data.xmlDeclaredTotal is number && data.xmlDeclaredTotal >= 0));
+      return data.grossAmount >= 0 &&
+        data.freightAmount >= 0 &&
+        data.get('discountAmount', 0) >= 0 &&
+        data.totalProducts >= 0 &&
+        data.icmsAmount >= 0 &&
+        data.get('icmsStAmount', 0) >= 0 &&
+        data.ipiAmount >= 0 &&
+        data.pisAmount >= 0 &&
+        data.cofinsAmount >= 0 &&
+        data.get('csllAmount', 0) >= 0 &&
+        data.get('issqnAmount', 0) >= 0 &&
+        data.get('issqnRetained', true) is bool &&
+        data.get('inssAmount', 0) >= 0 &&
+        data.get('irrfAmount', 0) >= 0 &&
+        data.get('retainedTaxesAmount', 0) >= 0 &&
+        data.get('taxRegime', '') in ['', 'mei', 'simples_nacional', 'regime_normal'] &&
+        data.totalInvoice >= 0 &&
+        data.get('xmlDeclaredTotal', 0) >= 0;
     }
 
     function validFiscalItems(data) {
-      return ((data.get('complementaryInfo', '') is string && data.get('complementaryInfo', '').size() <= 3000)) &&
+      return data.get('complementaryInfo', '') is string &&
         data.items is list && data.items.size() >= 1 && data.items.size() <= 50 &&
-        data.items[0] is map &&
-        data.items[0].description.matches('(?s)^.{1,200}$') &&
-        data.items[0].qty is number && data.items[0].qty > 0 &&
-        (!('itemAssociations' in data) || (data.itemAssociations is list && data.itemAssociations.size() <= 60));
+        data.items[0].description is string && data.items[0].description != '' && data.items[0].description.size() <= 200 &&
+        data.items[0].qty > 0 &&
+        data.get('itemAssociations', []) is list;
     }
 
     function validFiscalLinks(data) {
-      return data.purchaseOrderId.matches('(?s)^.{0,128}$') &&
-        data.poNumber.matches('(?s)^.{0,40}$') &&
-        data.receiptId.matches('(?s)^.{0,128}$') &&
-        data.receiptNumber.matches('(?s)^.{0,40}$') &&
-        (data.get('linkedInvoiceId', '').matches('(?s)^.{0,128}$')) &&
-        (data.get('linkedInvoiceNumber', '').matches('(?s)^.{0,20}$'));
-    }
-
-    function validFiscalTransport(data) {
-      return (data.get('originState', '').matches('(?s)^.{0,2}$')) &&
-        (data.get('originCity', '').matches('(?s)^.{0,120}$')) &&
-        (data.get('destinationState', '').matches('(?s)^.{0,2}$')) &&
-        (data.get('destinationCity', '').matches('(?s)^.{0,120}$')) &&
-        (data.get('suframaPinNumber', '').matches('(?s)^.{0,40}$')) &&
-        (isValidOptionalDateStr(data.get('suframaPinAcceptanceDate', ''))) &&
-        (isValidOptionalDateStr(data.get('suframaPinReceiptDate', ''))) &&
-        (isValidOptionalDateStr(data.get('suframaClearanceDate', '')));
+      return data.purchaseOrderId is string && data.purchaseOrderId.size() <= 128 &&
+        data.poNumber is string && data.poNumber.size() <= 40 &&
+        data.receiptId is string && data.receiptId.size() <= 128 &&
+        data.receiptNumber is string && data.receiptNumber.size() <= 40;
     }
 
     function validFiscalStatus(data) {
       return data.matchingStatus in ['pendente_vinculo', 'conciliada', 'divergente'] &&
         data.fiscalStatus in ['aguardando_recebimento', 'pendente', 'lancado', 'substituida', 'aguardando_escrituracao', 'escriturada', 'rejeitada'] &&
-        (!('requiresPhysicalReceipt' in data) || data.requiresPhysicalReceipt is bool) &&
-        (!('isPartialBilling' in data) || data.isPartialBilling is bool) &&
-        (data.get('replacedByInvoiceId', '').matches('(?s)^.{0,128}$')) &&
-        (data.get('replacedByInvoiceNumber', '').matches('(?s)^.{0,20}$')) &&
+        data.get('requiresPhysicalReceipt', false) is bool &&
+        data.get('isPartialBilling', false) is bool &&
         isValidOptionalDateStr(data.bookkeepingDate);
     }
 
     function validFiscalConference(data) {
-      return (!('conferenceStatus' in data) || data.conferenceStatus in ['', 'pendente', 'conferido']) &&
-        (!('conferenceOriginalOutcome' in data) || data.conferenceOriginalOutcome in ['', 'sem_divergencia', 'divergente']) &&
-        (data.get('conferenceConfirmedByUid', '').matches('(?s)^.{0,128}$')) &&
-        (data.get('conferenceConfirmedByName', '').matches('(?s)^.{0,120}$')) &&
-        (data.get('conferenceConfirmedAt', '').matches('(?s)^.{0,40}$')) &&
-        (data.get('conferenceJustification', '').matches('(?s)^.{0,600}$')) &&
-        (data.get('conferenceDataVersion', '').matches('(?s)^.{0,40}$')) &&
-        (data.get('pendingAdjustmentId', '').matches('(?s)^.{0,128}$')) &&
-        (data.get('pendingAdjustmentPoId', '').matches('(?s)^.{0,128}$')) &&
-        (data.get('pendingAdjustmentPoNumber', '').matches('(?s)^.{0,40}$')) &&
-        (!('adjustmentStatus' in data) || data.adjustmentStatus in [
+      return data.get('conferenceStatus', '') in ['', 'pendente', 'conferido'] &&
+        data.get('conferenceOriginalOutcome', '') in ['', 'sem_divergencia', 'divergente'] &&
+        data.get('conferenceJustification', '') is string &&
+        data.get('conferenceJustification', '').size() <= 600 &&
+        data.get('adjustmentStatus', '') in [
           '', 'Ajuste solicitado', 'Em análise', 'Ajustado',
           'Devolvido para revisão fiscal', 'Reaberto', 'Resolvido', 'Cancelado'
-        ]) &&
+        ] &&
         (
           data.get('pendingAdjustmentId', '') == '' ||
-          data.get('adjustmentStatus', '') in ['Resolvido', 'Cancelado'] ||
-          data.purchaseOrderId == ''
+          data.purchaseOrderId == '' ||
+          data.get('adjustmentStatus', '') in ['Resolvido', 'Cancelado']
         );
     }
 
     function validFiscalNotes(data) {
       return data.xmlImported is bool &&
-        data.notes.matches('(?s)^.{0,600}$');
+        data.notes is string && data.notes.size() <= 600;
     }
 
     function validFiscalAudit(data) {
       return isValidId(data.createdByUid) &&
-        data.createdByName is string && data.createdByName.matches('(?s)^.{1,120}$') &&
+        data.createdByName is string && data.createdByName != '' && data.createdByName.size() <= 120 &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
 
-    function validFiscalUpdate(data, old) {
-      let changed = data.diff(old).affectedKeys();
+    function validFiscalUpdate(data) {
       return validFiscalSchema(data) &&
-        (!changed.hasAny(['accessKey', 'cfop', 'docType', 'issueDate', 'issuerCnpj', 'issuerName', 'issuerState', 'nfeNumber', 'series']) || validFiscalIdentity(data)) &&
-        (!changed.hasAny(['cofinsAmount', 'csllAmount', 'discountAmount', 'freightAmount', 'grossAmount', 'icmsAmount', 'icmsDesonAmount', 'icmsStAmount', 'inssAmount', 'insuranceAmount', 'ipiAmount', 'irrfAmount', 'issqnAmount', 'issqnRetained', 'otherExpensesAmount', 'pisAmount', 'retainedTaxesAmount', 'surchargeAmount', 'taxRegime', 'totalInvoice', 'totalProducts', 'xmlDeclaredTotal']) || validFiscalAmounts(data)) &&
-        (!changed.hasAny(['complementaryInfo', 'itemAssociations', 'items']) || validFiscalItems(data)) &&
-        (!changed.hasAny(['linkedInvoiceId', 'linkedInvoiceNumber', 'poNumber', 'purchaseOrderId', 'receiptId', 'receiptNumber']) || validFiscalLinks(data)) &&
-        (!changed.hasAny(['destinationCity', 'destinationState', 'originCity', 'originState', 'suframaClearanceDate', 'suframaPinAcceptanceDate', 'suframaPinNumber', 'suframaPinReceiptDate']) || validFiscalTransport(data)) &&
-        (!changed.hasAny(['bookkeepingDate', 'fiscalStatus', 'isPartialBilling', 'matchingStatus', 'replacedByInvoiceId', 'replacedByInvoiceNumber', 'requiresPhysicalReceipt']) || validFiscalStatus(data)) &&
-        (!changed.hasAny(['adjustmentStatus', 'conferenceConfirmedAt', 'conferenceConfirmedByName', 'conferenceConfirmedByUid', 'conferenceDataVersion', 'conferenceJustification', 'conferenceOriginalOutcome', 'conferenceStatus', 'pendingAdjustmentId', 'pendingAdjustmentPoId', 'pendingAdjustmentPoNumber', 'purchaseOrderId']) || validFiscalConference(data)) &&
-        (!changed.hasAny(['notes', 'xmlImported']) || validFiscalNotes(data)) &&
-        (!changed.hasAny(['createdAt', 'createdByName', 'createdByUid', 'updatedAt']) || validFiscalAudit(data));
+        validFiscalIdentity(data) &&
+        validFiscalAmounts(data) &&
+        validFiscalItems(data) &&
+        validFiscalLinks(data) &&
+        validFiscalStatus(data) &&
+        validFiscalConference(data) &&
+        validFiscalNotes(data);
     }
 
     function isValidProductEquivalence(data) {
@@ -852,22 +807,20 @@ service cloud.firestore {
 
       // Permite alternar exigência de recebimento físico somente enquanto não houver recebimento vinculado e a nota não estiver lançada
       function isValidPhysicalReceiptUpdate(novo, anterior) {
-        return (!('requiresPhysicalReceipt' in novo) || novo.requiresPhysicalReceipt is bool) &&
+        return novo.get('requiresPhysicalReceipt', true) == anterior.get('requiresPhysicalReceipt', true) ||
           (
-            isImmutablePhysicalReceiptFlag(novo, anterior) ||
-            (
-              anterior.receiptId == '' &&
-              novo.receiptId == '' &&
-              !(anterior.fiscalStatus in ['lancado', 'escriturada']) &&
-              ('requiresPhysicalReceipt' in novo && novo.requiresPhysicalReceipt is bool)
-            )
+            anterior.receiptId == '' &&
+            novo.receiptId == '' &&
+            !(anterior.fiscalStatus in ['lancado', 'escriturada']) &&
+            ('requiresPhysicalReceipt' in novo && novo.requiresPhysicalReceipt is bool)
           );
       }
 
       function canCreateFiscalInvoice() {
         let data = request.resource.data;
+        let reqRec = needsPhysicalReceipt(data);
         return isVerified() &&
-        (isAdmin() || (hasSectorRole('fiscal') && sectorAllows('fiscal', 'canCreate'))) &&
+        (isAdminClaim() || (userDocExists() && isUserRoleActive(userData(), 'fiscal') && sectorAllows('fiscal', 'canCreate'))) &&
         isValidId(invoiceId) &&
         isValidFiscalInvoice(data) &&
         (
@@ -876,7 +829,7 @@ service cloud.firestore {
             data.purchaseOrderId != '' &&
             existsAfter(/databases/$(database)/documents/purchase_orders/$(data.purchaseOrderId)) &&
             (
-              !needsPhysicalReceipt(data) ||
+              !reqRec ||
               (
                 data.receiptId != '' &&
                 existsAfter(/databases/$(database)/documents/physical_receipts/$(data.receiptId)) &&
@@ -908,52 +861,28 @@ service cloud.firestore {
       function canUpdateFiscalInvoice() {
         let novo = request.resource.data;
         let anterior = resource.data;
+        let reqRec = needsPhysicalReceipt(novo);
+        let adm = isAdminClaim();
+        let u = (!adm && userDocExists()) ? userData() : {'status': '', 'role': ''};
 
         return isVerified() &&
         isValidId(invoiceId) &&
         isValidPhysicalReceiptUpdate(novo, anterior) &&
-        (needsPhysicalReceipt(novo) || novo.fiscalStatus != 'aguardando_recebimento') &&
-        (novo.receiptId == '' || needsPhysicalReceipt(novo)) &&
+        (reqRec || novo.fiscalStatus != 'aguardando_recebimento') &&
+        (novo.receiptId == '' || reqRec) &&
         (
-          isAdmin() ||
+          adm ||
           (
-            hasSectorRole('fiscal') &&
+            u.status == 'ativo' &&
+            u.role == 'fiscal' &&
             sectorAllows('fiscal', 'canEdit') &&
             !(anterior.fiscalStatus in ['lancado', 'escriturada']) &&
-            (
-              !(novo.fiscalStatus in ['lancado', 'escriturada']) ||
-              (
-                novo.purchaseOrderId != '' &&
-                (
-                  !needsPhysicalReceipt(novo) ||
-                  (
-                    novo.receiptId != '' &&
-                    exists(/databases/$(database)/documents/physical_receipts/$(novo.receiptId))
-                  )
-                )
-              )
-            ) &&
             (anterior.purchaseOrderId == '' || novo.purchaseOrderId == anterior.purchaseOrderId) &&
-            (anterior.receiptId == '' || novo.receiptId == anterior.receiptId) &&
-            novo.diff(anterior).affectedKeys().hasOnly([
-              'purchaseOrderId', 'poNumber', 'receiptId', 'receiptNumber',
-              'linkedInvoiceId', 'linkedInvoiceNumber',
-              'originState', 'originCity', 'destinationState', 'destinationCity',
-              'issuerState', 'suframaPinNumber', 'suframaPinAcceptanceDate', 'suframaPinReceiptDate', 'suframaClearanceDate',
-              'taxRegime', 'pisAmount', 'cofinsAmount', 'csllAmount', 'issqnAmount', 'issqnRetained', 'inssAmount', 'irrfAmount', 'retainedTaxesAmount',
-              'matchingStatus', 'fiscalStatus', 'requiresPhysicalReceipt', 'isPartialBilling', 'replacedByInvoiceId', 'replacedByInvoiceNumber',
-              'bookkeepingDate', 'cfop', 'notes', 'updatedAt',
-              'docType', 'accessKey', 'nfeNumber', 'series', 'issuerName', 'issuerCnpj', 'issueDate',
-              'grossAmount', 'freightAmount', 'insuranceAmount', 'otherExpensesAmount', 'surchargeAmount', 'discountAmount',
-              'totalProducts', 'icmsAmount', 'icmsDesonAmount', 'icmsStAmount', 'ipiAmount',
-              'totalInvoice', 'xmlDeclaredTotal', 'complementaryInfo', 'items', 'itemAssociations',
-              'conferenceStatus', 'conferenceOriginalOutcome', 'conferenceConfirmedByUid',
-              'conferenceConfirmedByName', 'conferenceConfirmedAt', 'conferenceJustification', 'conferenceDataVersion',
-              'pendingAdjustmentId', 'pendingAdjustmentPoId', 'pendingAdjustmentPoNumber', 'adjustmentStatus'
-            ])
+            (anterior.receiptId == '' || novo.receiptId == anterior.receiptId)
           ) ||
           (
-            hasSectorRole('recebimento') &&
+            u.status == 'ativo' &&
+            u.role == 'recebimento' &&
             needsPhysicalReceipt(anterior) &&
             anterior.fiscalStatus == 'aguardando_recebimento' &&
             novo.fiscalStatus == 'pendente' &&
@@ -966,7 +895,8 @@ service cloud.firestore {
             ])
           ) ||
           (
-            hasSectorRole('recebimento') &&
+            u.status == 'ativo' &&
+            u.role == 'recebimento' &&
             sectorAllows('recebimento', 'canDelete') &&
             !(anterior.fiscalStatus in ['lancado', 'escriturada']) &&
             anterior.receiptId != '' &&
@@ -984,14 +914,14 @@ service cloud.firestore {
             ])
           )
         ) &&
-        validFiscalUpdate(novo, anterior) &&
+        validFiscalUpdate(novo) &&
         (
           !(novo.fiscalStatus in ['lancado', 'escriturada']) ||
           (
             novo.purchaseOrderId != '' &&
             existsAfter(/databases/$(database)/documents/purchase_orders/$(novo.purchaseOrderId)) &&
             (
-              !needsPhysicalReceipt(novo) ||
+              !reqRec ||
               (
                 novo.receiptId != '' &&
                 existsAfter(/databases/$(database)/documents/physical_receipts/$(novo.receiptId)) &&

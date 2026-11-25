@@ -8,7 +8,11 @@ import {
   buildDeterministicItemAssociations,
   computeAssociationMetrics,
 } from '../src/utils/itemReconciliation';
-import { evaluatePreImportMatch, evaluateThreeWayMatch } from '../src/utils/matching';
+import {
+  evaluatePreImportMatch,
+  evaluateThreeWayMatch,
+  shouldShowPoInReceivingList,
+} from '../src/utils/matching';
 import { PhysicalReceipt, ProductEquivalence, PurchaseOrder } from '../src/types/p2p';
 
 let passed = 0;
@@ -552,4 +556,105 @@ test('buildConferenceFingerprint changes deterministically when PO or invoice ch
   assert(baseFp !== changedPoFp, 'Fingerprint must change when PO totalAmount is edited');
 });
 
+// 7. Receiving PO List Visibility (Dispensed Invoices)
+test('shouldShowPoInReceivingList hides POs linked only to dispensed invoices and keeps POs with pending physical receipts', () => {
+  assertEqual(
+    shouldShowPoInReceivingList(
+      { id: 'po_1', status: 'aberto' },
+      [
+        {
+          purchaseOrderId: 'po_1',
+          fiscalStatus: 'pendente',
+          requiresPhysicalReceipt: false,
+        },
+      ]
+    ),
+    false,
+    'PO with active dispensed invoice (pendente) must be hidden from Receiving PO list'
+  );
+
+  assertEqual(
+    shouldShowPoInReceivingList(
+      { id: 'po_1', status: 'aberto' },
+      [
+        {
+          purchaseOrderId: 'po_1',
+          fiscalStatus: 'lancado',
+          requiresPhysicalReceipt: false,
+        },
+      ]
+    ),
+    false,
+    'PO with active dispensed invoice (lancado) must be hidden from Receiving PO list'
+  );
+
+  assertEqual(
+    shouldShowPoInReceivingList(
+      { id: 'po_1', status: 'aberto' },
+      [
+        {
+          purchaseOrderId: 'po_1',
+          fiscalStatus: 'aguardando_recebimento',
+          requiresPhysicalReceipt: true,
+        },
+      ]
+    ),
+    true,
+    'PO with invoice awaiting physical receipt must appear in Receiving PO list'
+  );
+
+  assertEqual(
+    shouldShowPoInReceivingList({ id: 'po_1', status: 'aberto' }, []),
+    true,
+    'PO without linked invoices must appear in Receiving PO list'
+  );
+
+  assertEqual(
+    shouldShowPoInReceivingList(
+      { id: 'po_1', status: 'parcialmente_atendido' },
+      [
+        {
+          purchaseOrderId: 'po_1',
+          fiscalStatus: 'lancado',
+          requiresPhysicalReceipt: false,
+        },
+        {
+          purchaseOrderId: 'po_1',
+          fiscalStatus: 'aguardando_recebimento',
+          requiresPhysicalReceipt: true,
+        },
+      ]
+    ),
+    true,
+    'PO with a dispensed invoice and another invoice awaiting physical receipt must remain visible'
+  );
+
+  assertEqual(
+    shouldShowPoInReceivingList(
+      { id: 'po_1', status: 'aberto' },
+      [
+        {
+          purchaseOrderId: 'po_1',
+          fiscalStatus: 'substituida',
+          requiresPhysicalReceipt: false,
+        },
+        {
+          purchaseOrderId: 'po_1',
+          fiscalStatus: 'rejeitada',
+          requiresPhysicalReceipt: false,
+        },
+      ]
+    ),
+    true,
+    'Replaced or rejected dispensed invoices must not hide the PO'
+  );
+
+  assertEqual(
+    shouldShowPoInReceivingList({ id: 'po_1', status: 'cancelado' }, []),
+    false,
+    'Cancelled PO must remain hidden'
+  );
+});
+
 console.log(`\nAll ${passed} P2P Fiscal Engine tests passed!`);
+
