@@ -6,12 +6,14 @@
 3. **Strict Sector Isolation (RBAC)**:
    - `compras` may only create/edit/delete in `/purchase_orders`.
    - `recebimento` may only create/edit/delete in `/physical_receipts`.
-   - `fiscal` may only create/edit/delete in `/fiscal_invoices`.
+   - `fiscal` may only create/edit/delete in `/fiscal_invoices` and `/product_equivalences`.
+   - `/adjustment_requests` enforces a strict cross-sector state machine: only `fiscal` can create/reopen/resolve/cancel requests, and `compras` can only update response fields and transition status to `'Em análise' | 'Ajustado' | 'Devolvido para revisão fiscal'`.
    - No sector may write to another sector's collection.
    - `adm_titular` has unrestricted create/edit/unlink/delete authority across all collections and manages `/users`, `/user_invites`, and `/sector_permissions`.
 4. **Relational Integrity**:
    - A `PhysicalReceipt` referencing a non-empty `purchaseOrderId` must reference an existing `/purchase_orders/{purchaseOrderId}`.
    - A `FiscalInvoice` referencing a non-empty `purchaseOrderId` or `receiptId` must reference existing documents in `/purchase_orders` and `/physical_receipts`.
+   - A `FiscalInvoice` with an active unresolved `pendingAdjustmentId` must keep `purchaseOrderId == ''` until the adjustment is resolved or cancelled.
 5. **Terminal State & Timestamp Integrity**:
    - `createdAt` and owner UIDs (`createdByUid`, `receivedByUid`) are immutable after creation.
    - `createdAt` and `updatedAt` must equal `request.time`.

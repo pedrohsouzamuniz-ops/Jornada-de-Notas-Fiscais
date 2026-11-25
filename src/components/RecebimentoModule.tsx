@@ -34,6 +34,7 @@ export function RecebimentoModule() {
     purchaseOrders,
     physicalReceipts,
     fiscalInvoices,
+    productEquivalences,
     canAccessSectorData,
     canCreateInSector,
     canEditInSector,
@@ -117,13 +118,14 @@ export function RecebimentoModule() {
     return map;
   };
 
-  // Available XMLs with status 'aguardando_recebimento' matching PO's CNPJ
+  // Available XMLs with status 'aguardando_recebimento' requiring physical receipt and matching PO's CNPJ
   const matchingAvailableInvoices = useMemo(() => {
     if (!targetPo) return [];
     const poCnpj = normalizeCnpjDigits(targetPo.supplierCnpj);
     return fiscalInvoices.filter(
       (inv) =>
         inv.fiscalStatus === 'aguardando_recebimento' &&
+        (inv.requiresPhysicalReceipt ?? true) &&
         normalizeCnpjDigits(inv.issuerCnpj) === poCnpj
     );
   }, [targetPo, fiscalInvoices]);
@@ -170,6 +172,13 @@ export function RecebimentoModule() {
     return getPreviouslyReceivedMap(targetPo.id, editingReceipt?.id);
   }, [targetPo, editingReceipt, physicalReceipts]);
 
+  const selectedInvoiceObj = useMemo(
+    () => fiscalInvoices.find((inv) => inv.id === selectedInvoiceId) || null,
+    [fiscalInvoices, selectedInvoiceId]
+  );
+
+  const isSelectedInvoicePartial = Boolean(selectedInvoiceObj?.isPartialBilling);
+
   const updateItemConference = (
     idx: number,
     field: 'qtyReceived' | 'condition',
@@ -184,8 +193,12 @@ export function RecebimentoModule() {
           const remainingBefore = Math.max(0, it.qtyOrdered - prevQty);
           const numVal = Math.max(0, Number(value));
           next.qtyReceived = numVal;
-          next.condition =
-            Math.abs(numVal - remainingBefore) > 0.001 ? 'divergente' : 'conforme';
+          if (isSelectedInvoicePartial) {
+            next.condition = numVal > remainingBefore + 0.001 ? 'divergente' : 'conforme';
+          } else {
+            next.condition =
+              Math.abs(numVal - remainingBefore) > 0.001 ? 'divergente' : 'conforme';
+          }
         }
         return next;
       })
@@ -226,10 +239,14 @@ export function RecebimentoModule() {
     const hasIssue = items.some((it) => {
       const prevQty = prevReceivedMap.get(`${it.code}::${it.description}`) || 0;
       const expectedNow = Math.max(0, it.qtyOrdered - prevQty);
-      return it.condition !== 'conforme' || Math.abs(it.qtyReceived - expectedNow) > 0.001;
+      if (it.condition !== 'conforme') return true;
+      if (isSelectedInvoicePartial) {
+        return it.qtyReceived > expectedNow + 0.001;
+      }
+      return Math.abs(it.qtyReceived - expectedNow) > 0.001;
     });
     return hasIssue ? 'divergencia' : 'conferido';
-  }, [items, prevReceivedMap]);
+  }, [items, prevReceivedMap, isSelectedInvoicePartial]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -293,7 +310,13 @@ export function RecebimentoModule() {
         const match = evaluateThreeWayMatch(
           selectedInvoice,
           targetPo,
-          tempReceiptForMatch
+          tempReceiptForMatch,
+          {
+            savedEquivalences: productEquivalences,
+            otherLinkedInvoicesForPo: fiscalInvoices.filter(
+              (f) => f.purchaseOrderId === targetPo.id && f.id !== selectedInvoice.id
+            ),
+          }
         );
 
         await createPhysicalReceipt(
@@ -786,6 +809,7 @@ export function RecebimentoModule() {
                           <option key={inv.id} value={inv.id}>
                             {inv.docType || 'NFE'} Nº {inv.nfeNumber} (Série {inv.series}) · Emissão{' '}
                             {formatDateBR(inv.issueDate)} · Total {formatBRL(inv.totalInvoice)}
+                            {inv.isPartialBilling ? ' [Faturamento Parcial]' : ''}
                           </option>
                         ))}
                       </select>

@@ -1,16 +1,39 @@
 import {
+  FiscalDocType,
   FiscalInvoice,
+  FiscalItemAssociation,
   MatchingStatus,
   PhysicalReceipt,
+  ProductEquivalence,
   PurchaseOrder,
 } from '../types/p2p';
+import {
+  FinancialComparisonResult,
+  comparePurchaseOrderAndInvoice,
+  roundMoney,
+} from './fiscalCalculations';
 import { formatBRL, normalizeCnpjDigits } from './formatters';
+import {
+  ItemMatchSuggestion,
+  buildDeterministicItemAssociations,
+  computeAssociationMetrics,
+} from './itemReconciliation';
 
 export interface ThreeWayItemComparison {
+  associationId?: string;
+  invoiceItemIndexes: number[];
+  poItemIndexes: number[];
   code: string;
   description: string;
+  poCode?: string;
+  poDescription?: string;
+  poUnit?: string;
+  invoiceUnit?: string;
+  conversionFactor: number;
+  origin: 'smart' | 'equivalence' | 'manual' | 'unmatched';
   poQty: number | null;
   invoiceQty: number | null;
+  invoiceRawQty?: number | null;
   poUnitPrice: number | null;
   invoiceUnitPrice: number | null;
   qtyMatch: boolean;
@@ -18,222 +41,146 @@ export interface ThreeWayItemComparison {
   matchedInPo: boolean;
 }
 
+export type ConferenceBadgeState =
+  | 'sem_divergencia'
+  | 'divergente'
+  | 'aguardando_conciliacao'
+  | 'aguardando_vinculo'
+  | 'aguardando_ajuste_compras';
+
+export interface OtherLinkedInvoiceInput {
+  id: string;
+  docType?: FiscalDocType;
+  grossAmount?: number;
+  totalProducts?: number;
+  totalInvoice?: number;
+  discountAmount?: number;
+  otherExpensesAmount?: number;
+  surchargeAmount?: number;
+  items: FiscalInvoice['items'];
+  itemAssociations?: FiscalItemAssociation[];
+}
+
+export interface EvaluateMatchOptions {
+  savedEquivalences?: ProductEquivalence[];
+  otherLinkedInvoicesForPo?: OtherLinkedInvoiceInput[];
+  isPreImport?: boolean;
+}
+
 export interface ThreeWayMatchDetails {
   status: MatchingStatus;
+  conferenceBadgeState: ConferenceBadgeState;
   reasons: string[];
   poGrossTotal: number | null;
-  poTotal: number | null; // Valor líquido do pedido
+  poTotal: number | null; // Valor de referência do Pedido utilizado na comparação (total ou parcela faturada)
+  poFullTotal: number | null; // Valor líquido total do Pedido de Compra
   invoiceGrossTotal: number;
   invoiceTotal: number; // Valor líquido da nota
   grossMatch: boolean | null;
   netMatch: boolean | null;
+  financialComparison: FinancialComparisonResult | null;
+  isPartialBilling: boolean;
   qtyMatch: boolean | null;
   unitPricesMatch: boolean | null;
   receivedQtyTotal: number | null;
   orderedQtyTotal: number | null;
   invoiceQtyTotal: number;
   itemComparisons: ThreeWayItemComparison[];
+  associations: FiscalItemAssociation[];
+  suggestions: ItemMatchSuggestion[];
+  unmatchedInvoiceItemIndexes: number[];
+  unmatchedPoItemIndexes: number[];
 }
 
-function normalizeItemText(value: string): string {
-  return (value || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function isGenericCode(code: string): boolean {
-  const c = normalizeItemText(code);
-  return !c || /^(item|mat|prod|serv)[-_\s]*\d+$/.test(c);
-}
-
-function tokenSimilarity(a: string, b: string): number {
-  const tokensA = new Set(normalizeItemText(a).split(' ').filter((t) => t.length >= 2));
-  const tokensB = new Set(normalizeItemText(b).split(' ').filter((t) => t.length >= 2));
-  if (tokensA.size === 0 || tokensB.size === 0) return 0;
-  let hits = 0;
-  tokensA.forEach((t) => {
-    if (tokensB.has(t)) hits += 1;
-  });
-  return hits / Math.max(tokensA.size, tokensB.size);
-}
-
-function buildItemComparisons(
+function getOtherInvoicesBilledByPoItem(
   po: PurchaseOrder,
-  invoiceItems: FiscalInvoice['items']
-): {
-  comparisons: ThreeWayItemComparison[];
-  itemReasons: string[];
-  unitPricesMatch: boolean;
-} {
-  const comparisons: ThreeWayItemComparison[] = [];
-  const itemReasons: string[] = [];
-  const usedPoIndices = new Set<number>();
-  let allUnitPricesMatch = true;
-
-  const findBestPoIndex = (invItem: FiscalInvoice['items'][number], invIdx: number): number => {
-    const invCode = normalizeItemText(invItem.code);
-    const invDesc = normalizeItemText(invItem.description);
-
-    // 1. Non-generic exact code match
-    if (invCode && !isGenericCode(invItem.code)) {
-      const idx = po.items.findIndex(
-        (p, i) => !usedPoIndices.has(i) && normalizeItemText(p.code) === invCode
-      );
-      if (idx !== -1) return idx;
-    }
-
-    // 2. Exact normalized description match
-    if (invDesc) {
-      const idx = po.items.findIndex(
-        (p, i) => !usedPoIndices.has(i) && normalizeItemText(p.description) === invDesc
-      );
-      if (idx !== -1) return idx;
-    }
-
-    // 3. Single item 1-to-1 pairing
-    if (po.items.length === 1 && invoiceItems.length === 1 && !usedPoIndices.has(0)) {
-      return 0;
-    }
-
-    // 4. Token similarity / substring match
-    let bestIdx = -1;
-    let bestScore = 0;
-    po.items.forEach((p, i) => {
-      if (usedPoIndices.has(i)) return;
-      const poDesc = normalizeItemText(p.description);
-      if (invDesc && poDesc && (invDesc.includes(poDesc) || poDesc.includes(invDesc))) {
-        if (0.85 > bestScore) {
-          bestScore = 0.85;
-          bestIdx = i;
-        }
-        return;
-      }
-      const sim = tokenSimilarity(p.description, invItem.description);
-      if (sim >= 0.45 && sim > bestScore) {
-        bestScore = sim;
-        bestIdx = i;
-      }
+  otherInvoices: OtherLinkedInvoiceInput[],
+  savedEquivalences: ProductEquivalence[]
+): Map<number, number> {
+  const billedByPo = new Map<number, number>();
+  otherInvoices.forEach((other) => {
+    const { associations } = buildDeterministicItemAssociations({
+      docType: other.docType || 'NFE',
+      supplierCnpj: po.supplierCnpj,
+      invoiceItems: other.items || [],
+      poItems: po.items,
+      savedEquivalences,
+      existingAssociations: other.itemAssociations,
     });
-    if (bestIdx !== -1) return bestIdx;
-
-    // 5. Exact positional fallback if same count and exact same code even if generic
-    if (
-      po.items.length === invoiceItems.length &&
-      !usedPoIndices.has(invIdx) &&
-      invCode &&
-      normalizeItemText(po.items[invIdx].code) === invCode
-    ) {
-      return invIdx;
-    }
-
-    return -1;
-  };
-
-  invoiceItems.forEach((invItem, invIdx) => {
-    const poIdx = findBestPoIndex(invItem, invIdx);
-    const invQty = Number(invItem.qty || 0);
-    const invUnit = Number(invItem.unitPrice || 0);
-
-    if (poIdx === -1) {
-      allUnitPricesMatch = false;
-      comparisons.push({
-        code: invItem.code,
-        description: invItem.description,
-        poQty: null,
-        invoiceQty: invQty,
-        poUnitPrice: null,
-        invoiceUnitPrice: invUnit,
-        qtyMatch: false,
-        unitPriceMatch: false,
-        matchedInPo: false,
+    associations.forEach((assoc) => {
+      const metrics = computeAssociationMetrics({
+        assoc,
+        invoiceItems: other.items || [],
+        poItems: po.items,
       });
-      itemReasons.push(`Item "${invItem.description}" da nota não localizado no Pedido de Compra`);
-      return;
-    }
-
-    usedPoIndices.add(poIdx);
-    const poItem = po.items[poIdx];
-    const poQty = Number(poItem.qtyOrdered || 0);
-    const poUnit = Number(poItem.unitPrice || 0);
-
-    const qtyMatch = Math.abs(poQty - invQty) <= 0.001;
-    const unitPriceMatch = Math.abs(poUnit - invUnit) <= 0.02;
-
-    if (!unitPriceMatch) {
-      allUnitPricesMatch = false;
-    }
-    if (!qtyMatch) {
-      itemReasons.push(
-        `Qtd de "${invItem.description}" na NF (${invQty}) diverge do Pedido (${poQty})`
-      );
-    }
-
-    comparisons.push({
-      code: invItem.code || poItem.code,
-      description: invItem.description || poItem.description,
-      poQty,
-      invoiceQty: invQty,
-      poUnitPrice: poUnit,
-      invoiceUnitPrice: invUnit,
-      qtyMatch,
-      unitPriceMatch,
-      matchedInPo: true,
+      if (assoc.poItemIndexes.length === 1) {
+        const poIdx = assoc.poItemIndexes[0];
+        billedByPo.set(
+          poIdx,
+          Number(((billedByPo.get(poIdx) || 0) + metrics.invoiceQtyConverted).toFixed(4))
+        );
+      } else {
+        assoc.poItemIndexes.forEach((poIdx) => {
+          const poItem = po.items[poIdx];
+          if (!poItem) return;
+          const addQty = Math.min(Number(poItem.qtyOrdered || 0), metrics.invoiceQtyConverted);
+          billedByPo.set(
+            poIdx,
+            Number(((billedByPo.get(poIdx) || 0) + addQty).toFixed(4))
+          );
+        });
+      }
     });
   });
-
-  // Any remaining PO items not present on the invoice
-  po.items.forEach((poItem, idx) => {
-    if (usedPoIndices.has(idx)) return;
-    comparisons.push({
-      code: poItem.code,
-      description: poItem.description,
-      poQty: Number(poItem.qtyOrdered || 0),
-      invoiceQty: null,
-      poUnitPrice: Number(poItem.unitPrice || 0),
-      invoiceUnitPrice: null,
-      qtyMatch: false,
-      unitPriceMatch: true,
-      matchedInPo: true,
-    });
-    itemReasons.push(
-      `Item "${poItem.description}" do Pedido (qtd ${poItem.qtyOrdered}) não faturado na nota`
-    );
-  });
-
-  return {
-    comparisons,
-    itemReasons,
-    unitPricesMatch: allUnitPricesMatch,
-  };
+  return billedByPo;
 }
 
 export function evaluateThreeWayMatch(
   invoice: Pick<
     FiscalInvoice,
     'issuerCnpj' | 'totalProducts' | 'totalInvoice' | 'items' | 'purchaseOrderId' | 'receiptId'
-  > & { grossAmount?: number },
+  > & {
+    id?: string;
+    docType?: FiscalDocType;
+    grossAmount?: number;
+    discountAmount?: number;
+    otherExpensesAmount?: number;
+    surchargeAmount?: number;
+    requiresPhysicalReceipt?: boolean;
+    isPartialBilling?: boolean;
+    itemAssociations?: FiscalItemAssociation[];
+    pendingAdjustmentId?: string;
+  },
   po?: PurchaseOrder,
-  receipt?: PhysicalReceipt
+  receipt?: PhysicalReceipt,
+  options?: EvaluateMatchOptions
 ): ThreeWayMatchDetails {
-  const invoiceQtyTotal = Number(
-    invoice.items.reduce((sum, it) => sum + Number(it.qty || 0), 0).toFixed(4)
+  const docType: FiscalDocType = invoice.docType || 'NFE';
+  const isPreImport = Boolean(options?.isPreImport);
+  const requiresPhysicalReceipt = invoice.requiresPhysicalReceipt ?? true;
+  const explicitPartialBilling = Boolean(invoice.isPartialBilling);
+  const savedEquivalences = options?.savedEquivalences || [];
+  const otherInvoices = (options?.otherLinkedInvoicesForPo || []).filter(
+    (other) => !invoice.id || other.id !== invoice.id
   );
-  const invoiceGrossTotal = Number(
-    Number(invoice.grossAmount ?? invoice.totalProducts ?? 0).toFixed(2)
-  );
-  const invoiceNetTotal = Number(Number(invoice.totalInvoice || 0).toFixed(2));
 
-  const poGrossTotal = po
-    ? Number(
-        po.items
-          .reduce((sum, it) => sum + Number(it.qtyOrdered || 0) * Number(it.unitPrice || 0), 0)
-          .toFixed(2)
+  const invoiceQtyTotal = Number(
+    (invoice.items || []).reduce((sum, it) => sum + Number(it.qty || 0), 0).toFixed(4)
+  );
+  const invoiceGrossTotal = roundMoney(
+    Number(invoice.grossAmount ?? invoice.totalProducts ?? 0)
+  );
+  const invoiceNetTotal = roundMoney(Number(invoice.totalInvoice || 0));
+
+  const poFullGrossTotal = po
+    ? roundMoney(
+        po.items.reduce(
+          (sum, it) => sum + Number(it.qtyOrdered || 0) * Number(it.unitPrice || 0),
+          0
+        )
       )
     : null;
-  const poNetTotal = po ? Number(Number(po.totalAmount || 0).toFixed(2)) : null;
+  const poFullNetTotal = po ? roundMoney(Number(po.totalAmount || 0)) : null;
   const orderedQtyTotal = po
     ? Number(po.items.reduce((sum, it) => sum + Number(it.qtyOrdered || 0), 0).toFixed(4))
     : null;
@@ -241,35 +188,324 @@ export function evaluateThreeWayMatch(
     ? Number(receipt.items.reduce((sum, it) => sum + Number(it.qtyReceived || 0), 0).toFixed(4))
     : null;
 
-  const grossMatch =
-    poGrossTotal !== null ? Math.abs(poGrossTotal - invoiceGrossTotal) <= 0.5 : null;
-  const netMatch = poNetTotal !== null ? Math.abs(poNetTotal - invoiceNetTotal) <= 0.5 : null;
-  const itemEval = po ? buildItemComparisons(po, invoice.items) : null;
+  const missingPo = !po || (!isPreImport && !invoice.purchaseOrderId);
+  const missingRequiredReceipt =
+    !isPreImport && requiresPhysicalReceipt && (!invoice.receiptId || !receipt);
 
-  if (!invoice.purchaseOrderId || !po || !invoice.receiptId || !receipt) {
-    const missing: string[] = [];
-    if (!invoice.purchaseOrderId || !po) missing.push('Pedido de Compra não vinculado');
-    if (!invoice.receiptId || !receipt) {
-      missing.push('Recebimento Físico não sinalizado (obrigatório para liberar lançamento)');
-    }
+  if (missingPo) {
     return {
       status: 'pendente_vinculo',
-      reasons: missing,
-      poGrossTotal,
-      poTotal: poNetTotal,
+      conferenceBadgeState: invoice.pendingAdjustmentId
+        ? 'aguardando_ajuste_compras'
+        : 'aguardando_vinculo',
+      reasons: [
+        invoice.pendingAdjustmentId
+          ? 'Aguardando ajuste do Pedido de Compra pelo setor de Compras'
+          : 'Pedido de Compra não vinculado (obrigatório para liberar lançamento)',
+      ],
+      poGrossTotal: null,
+      poTotal: null,
+      poFullTotal: null,
       invoiceGrossTotal,
       invoiceTotal: invoiceNetTotal,
-      grossMatch,
-      netMatch,
-      qtyMatch:
-        orderedQtyTotal !== null ? Math.abs(orderedQtyTotal - invoiceQtyTotal) <= 0.001 : null,
-      unitPricesMatch: itemEval ? itemEval.unitPricesMatch : null,
+      grossMatch: null,
+      netMatch: null,
+      financialComparison: null,
+      isPartialBilling: false,
+      qtyMatch: null,
+      unitPricesMatch: null,
       receivedQtyTotal,
-      orderedQtyTotal,
+      orderedQtyTotal: null,
       invoiceQtyTotal,
-      itemComparisons: itemEval ? itemEval.comparisons : [],
+      itemComparisons: (invoice.items || []).map((it, idx) => ({
+        invoiceItemIndexes: [idx],
+        poItemIndexes: [],
+        code: it.code,
+        description: it.description,
+        invoiceUnit: it.unit,
+        conversionFactor: 1,
+        origin: 'unmatched',
+        poQty: null,
+        invoiceQty: Number(it.qty || 0),
+        invoiceRawQty: Number(it.qty || 0),
+        poUnitPrice: null,
+        invoiceUnitPrice: Number(it.unitPrice || 0),
+        qtyMatch: false,
+        unitPriceMatch: false,
+        matchedInPo: false,
+      })),
+      associations: [],
+      suggestions: [],
+      unmatchedInvoiceItemIndexes: (invoice.items || []).map((_, idx) => idx),
+      unmatchedPoItemIndexes: [],
     };
   }
+
+  // Deterministic item reconciliation (preserving manual links & applying saved supplier equivalences)
+  const { associations, suggestions } = buildDeterministicItemAssociations({
+    docType,
+    supplierCnpj: po.supplierCnpj || invoice.issuerCnpj,
+    invoiceItems: invoice.items || [],
+    poItems: po.items,
+    savedEquivalences,
+    existingAssociations: invoice.itemAssociations,
+  });
+
+  const otherBilledByPoItem = getOtherInvoicesBilledByPoItem(
+    po,
+    otherInvoices,
+    savedEquivalences
+  );
+
+  const usedInv = new Set<number>();
+  const usedPo = new Set<number>();
+  const currentBilledByPoItem = new Map<number, number>();
+  const itemComparisons: ThreeWayItemComparison[] = [];
+  const itemReasons: string[] = [];
+  let allUnitPricesMatch = true;
+  let allQuantitiesMatchPo = true;
+  let hasAnyPartialPoItem = otherInvoices.length > 0;
+  let parcelAuthorizedExpectedItemsTotal = 0;
+
+  associations.forEach((assoc) => {
+    assoc.invoiceItemIndexes.forEach((i) => usedInv.add(i));
+    assoc.poItemIndexes.forEach((i) => usedPo.add(i));
+
+    const metrics = computeAssociationMetrics({
+      assoc,
+      invoiceItems: invoice.items || [],
+      poItems: po.items,
+    });
+
+    const firstInv = (invoice.items || [])[assoc.invoiceItemIndexes[0]];
+    const firstPo = po.items[assoc.poItemIndexes[0]];
+    const invLabel = assoc.invoiceItemIndexes
+      .map((i) => invoice.items[i]?.description)
+      .filter(Boolean)
+      .join(' + ');
+    const poLabel = assoc.poItemIndexes
+      .map((i) => po.items[i]?.description)
+      .filter(Boolean)
+      .join(' + ');
+
+    let priorBilled = 0;
+    let remainingAuthorizedQty = 0;
+    if (assoc.poItemIndexes.length === 1) {
+      const poIdx = assoc.poItemIndexes[0];
+      priorBilled = otherBilledByPoItem.get(poIdx) || 0;
+      remainingAuthorizedQty = Math.max(0, Number(po.items[poIdx].qtyOrdered || 0) - priorBilled);
+      currentBilledByPoItem.set(
+        poIdx,
+        Number(((currentBilledByPoItem.get(poIdx) || 0) + metrics.invoiceQtyConverted).toFixed(4))
+      );
+    } else {
+      priorBilled = assoc.poItemIndexes.reduce(
+        (s, idx) => s + (otherBilledByPoItem.get(idx) || 0),
+        0
+      );
+      remainingAuthorizedQty = Math.max(0, metrics.poQtyTotal - priorBilled);
+      assoc.poItemIndexes.forEach((poIdx) => {
+        currentBilledByPoItem.set(
+          poIdx,
+          Number(((currentBilledByPoItem.get(poIdx) || 0) + metrics.invoiceQtyConverted).toFixed(4))
+        );
+      });
+    }
+
+    const cumulativeQty = Number((priorBilled + metrics.invoiceQtyConverted).toFixed(4));
+    const exceedsPoQty = cumulativeQty > metrics.poQtyTotal + 0.001;
+    const isPartialForItem =
+      metrics.invoiceQtyConverted + 0.001 < remainingAuthorizedQty || priorBilled > 0.001;
+    if (isPartialForItem) {
+      hasAnyPartialPoItem = true;
+    }
+
+    // Parcel authorized value caps at remaining PO qty so excessive billing still flags financially!
+    const authorizedQtyForParcel = Math.min(metrics.invoiceQtyConverted, remainingAuthorizedQty);
+    parcelAuthorizedExpectedItemsTotal += authorizedQtyForParcel * metrics.poUnitPriceEffective;
+
+    if (!metrics.unitPriceMatch) {
+      allUnitPricesMatch = false;
+      itemReasons.push(
+        `Valor unitário de "${invLabel}" na nota (${formatBRL(
+          metrics.invoiceUnitPriceEffective
+        )}) diverge do Pedido (${formatBRL(metrics.poUnitPriceEffective)})`
+      );
+    }
+
+    const effectiveQtyMatch = exceedsPoQty
+      ? false
+      : explicitPartialBilling
+      ? metrics.invoiceQtyConverted > 0
+      : priorBilled > 0.001
+      ? Math.abs(metrics.invoiceQtyConverted - remainingAuthorizedQty) <= 0.001
+      : metrics.qtyMatch;
+
+    if (!effectiveQtyMatch) {
+      allQuantitiesMatchPo = false;
+      if (exceedsPoQty) {
+        itemReasons.push(
+          priorBilled > 0.001
+            ? `Qtd acumulada de "${invLabel}" (${cumulativeQty}, sendo ${priorBilled} em notas anteriores + ${metrics.invoiceQtyConverted} nesta nota) excede o Pedido (${metrics.poQtyTotal})`
+            : `Qtd de "${invLabel}" na NF (${metrics.invoiceQtyConverted}) excede o Pedido (${metrics.poQtyTotal})`
+        );
+      } else {
+        itemReasons.push(
+          `Qtd de "${invLabel}" na NF (${metrics.invoiceQtyConverted}) diverge do Pedido (${metrics.poQtyTotal})`
+        );
+      }
+    }
+
+    itemComparisons.push({
+      associationId: assoc.id,
+      invoiceItemIndexes: assoc.invoiceItemIndexes,
+      poItemIndexes: assoc.poItemIndexes,
+      code: firstInv?.code || firstPo?.code || '',
+      description: invLabel || poLabel,
+      poCode: firstPo?.code,
+      poDescription: poLabel,
+      poUnit: firstPo?.unit,
+      invoiceUnit: firstInv?.unit,
+      conversionFactor: assoc.conversionFactor,
+      origin: assoc.origin,
+      poQty: metrics.poQtyTotal,
+      invoiceQty: metrics.invoiceQtyConverted,
+      invoiceRawQty: metrics.invoiceRawQtySum,
+      poUnitPrice: metrics.poUnitPriceEffective,
+      invoiceUnitPrice: metrics.invoiceUnitPriceEffective,
+      qtyMatch: effectiveQtyMatch,
+      unitPriceMatch: metrics.unitPriceMatch,
+      matchedInPo: true,
+    });
+  });
+
+  const unmatchedInvoiceItemIndexes: number[] = [];
+  (invoice.items || []).forEach((invItem, idx) => {
+    if (usedInv.has(idx)) return;
+    unmatchedInvoiceItemIndexes.push(idx);
+    allUnitPricesMatch = false;
+    allQuantitiesMatchPo = false;
+    itemComparisons.push({
+      invoiceItemIndexes: [idx],
+      poItemIndexes: [],
+      code: invItem.code,
+      description: invItem.description,
+      invoiceUnit: invItem.unit,
+      conversionFactor: 1,
+      origin: 'unmatched',
+      poQty: null,
+      invoiceQty: Number(invItem.qty || 0),
+      invoiceRawQty: Number(invItem.qty || 0),
+      poUnitPrice: null,
+      invoiceUnitPrice: Number(invItem.unitPrice || 0),
+      qtyMatch: false,
+      unitPriceMatch: false,
+      matchedInPo: false,
+    });
+    itemReasons.push(
+      `Item "${invItem.description}" da nota aguardando conciliação com o Pedido de Compra`
+    );
+  });
+
+  const unmatchedPoItemIndexes: number[] = [];
+  po.items.forEach((poItem, idx) => {
+    if (usedPo.has(idx)) return;
+    unmatchedPoItemIndexes.push(idx);
+    const priorBilled = otherBilledByPoItem.get(idx) || 0;
+    const remaining = Math.max(0, Number(poItem.qtyOrdered || 0) - priorBilled);
+    if (remaining > 0.001) {
+      hasAnyPartialPoItem = true;
+      if (!explicitPartialBilling) {
+        allQuantitiesMatchPo = false;
+      }
+      itemComparisons.push({
+        invoiceItemIndexes: [],
+        poItemIndexes: [idx],
+        code: poItem.code,
+        description: poItem.description,
+        poCode: poItem.code,
+        poDescription: poItem.description,
+        poUnit: poItem.unit,
+        conversionFactor: 1,
+        origin: 'unmatched',
+        poQty: Number(poItem.qtyOrdered || 0),
+        invoiceQty: priorBilled > 0 ? priorBilled : null,
+        invoiceRawQty: priorBilled > 0 ? priorBilled : null,
+        poUnitPrice: Number(poItem.unitPrice || 0),
+        invoiceUnitPrice: null,
+        qtyMatch: explicitPartialBilling,
+        unitPriceMatch: true,
+        matchedInPo: true,
+      });
+      if (!explicitPartialBilling) {
+        itemReasons.push(
+          `Item "${poItem.description}" do Pedido (qtd ${poItem.qtyOrdered}) não faturado nesta nota`
+        );
+      }
+    }
+  });
+
+  // Check if entire PO is fully billed by this single invoice or if it is a partial billing parcel
+  const allPoItemsCovered100PercentInThisSingleInvoice =
+    otherInvoices.length === 0 &&
+    po.items.every((p, idx) => {
+      const billedNow = currentBilledByPoItem.get(idx) || 0;
+      return Math.abs(billedNow - Number(p.qtyOrdered || 0)) <= 0.001;
+    });
+
+  const isPartialBilling =
+    explicitPartialBilling ||
+    (!allPoItemsCovered100PercentInThisSingleInvoice &&
+      (hasAnyPartialPoItem || otherInvoices.length > 0));
+
+  let expectedPoForComparison = poFullNetTotal ?? 0;
+  let poGrossForComparison = poFullGrossTotal ?? 0;
+
+  if (isPartialBilling && associations.length > 0) {
+    // Check if this invoice finishes all remaining quantities of the PO when combined with other linked invoices
+    const completesRemainingPo = po.items.every((p, idx) => {
+      const prior = otherBilledByPoItem.get(idx) || 0;
+      const now = currentBilledByPoItem.get(idx) || 0;
+      return Math.abs(prior + now - Number(p.qtyOrdered || 0)) <= 0.001;
+    });
+
+    if (completesRemainingPo && otherInvoices.length > 0) {
+      const priorComparedSum = otherInvoices.reduce((s, o) => {
+        const comp = comparePurchaseOrderAndInvoice({
+          docType: o.docType || 'NFE',
+          invoiceGrossTotal: Number(o.grossAmount ?? o.totalProducts ?? 0),
+          invoiceNetTotal: Number(o.totalInvoice || 0),
+          invoiceDiscountAmount: o.discountAmount,
+          invoiceOtherExpenses: o.otherExpensesAmount,
+          invoiceSurcharge: o.surchargeAmount,
+          expectedPoAmount: 0,
+        });
+        return s + comp.invoiceComparedAmount;
+      }, 0);
+      expectedPoForComparison = roundMoney(Math.max(0, (poFullNetTotal ?? 0) - priorComparedSum));
+      poGrossForComparison = roundMoney(parcelAuthorizedExpectedItemsTotal);
+    } else {
+      expectedPoForComparison = roundMoney(parcelAuthorizedExpectedItemsTotal);
+      poGrossForComparison = roundMoney(parcelAuthorizedExpectedItemsTotal);
+    }
+  }
+
+  const financialComparison = comparePurchaseOrderAndInvoice({
+    docType,
+    invoiceGrossTotal,
+    invoiceNetTotal,
+    invoiceDiscountAmount: invoice.discountAmount,
+    invoiceOtherExpenses: invoice.otherExpensesAmount,
+    invoiceSurcharge: invoice.surchargeAmount,
+    expectedPoAmount: expectedPoForComparison,
+    isPartialBilling,
+  });
+
+  const grossMatch =
+    poGrossForComparison !== null
+      ? Math.round(poGrossForComparison * 100) === Math.round(invoiceGrossTotal * 100)
+      : null;
+  const netMatch = financialComparison.matches;
 
   const reasons: string[] = [];
 
@@ -279,56 +515,116 @@ export function evaluateThreeWayMatch(
     reasons.push('CNPJ do emitente da nota difere do fornecedor do Pedido');
   }
 
-  const orderedQty = orderedQtyTotal ?? 0;
-  const receivedQty = receivedQtyTotal ?? 0;
-  let qtyOk = true;
+  let qtyOk = allQuantitiesMatchPo;
 
-  if (Math.abs(orderedQty - receivedQty) > 0.001) {
-    qtyOk = false;
-    reasons.push(`Qtd recebida na doca (${receivedQty}) difere da pedida (${orderedQty})`);
+  if (!isPreImport && receipt) {
+    const receivedQty = receivedQtyTotal ?? 0;
+    const orderedQty = orderedQtyTotal ?? 0;
+    if (explicitPartialBilling) {
+      if (receivedQty > orderedQty + 0.001) {
+        qtyOk = false;
+        reasons.push(
+          `Qtd recebida na doca (${receivedQty}) excede a quantidade total pedida (${orderedQty})`
+        );
+      }
+    } else if (Math.abs(orderedQty - receivedQty) > 0.001) {
+      qtyOk = false;
+      reasons.push(`Qtd recebida na doca (${receivedQty}) difere da pedida (${orderedQty})`);
+    }
+    if (Math.abs(receivedQty - invoiceQtyTotal) > 0.001) {
+      qtyOk = false;
+      reasons.push(`Qtd faturada na nota (${invoiceQtyTotal}) difere do recebimento (${receivedQty})`);
+    }
+    if (receipt.status === 'divergencia') {
+      reasons.push('Recebimento físico registrado com divergência/avaria');
+    }
   }
 
-  if (Math.abs(receivedQty - invoiceQtyTotal) > 0.001) {
-    qtyOk = false;
-    reasons.push(`Qtd faturada na nota (${invoiceQtyTotal}) difere do recebimento (${receivedQty})`);
+  if (financialComparison.divergenceReason) {
+    reasons.push(financialComparison.divergenceReason);
   }
 
-  if (Math.abs(orderedQty - invoiceQtyTotal) > 0.001) {
-    qtyOk = false;
+  if (itemReasons.length > 0) {
+    reasons.push(...itemReasons);
   }
 
-  if (receipt.status === 'divergencia') {
-    reasons.push('Recebimento físico registrado com divergência/avaria');
+  const hasUnreconciledItems = unmatchedInvoiceItemIndexes.length > 0;
+  let conferenceBadgeState: ConferenceBadgeState = 'sem_divergencia';
+  if (hasUnreconciledItems) {
+    conferenceBadgeState = 'aguardando_conciliacao';
+  } else if (reasons.length > 0) {
+    conferenceBadgeState = 'divergente';
   }
 
-  // Somente o Valor Líquido da nota vs Valor do Pedido gera alerta de divergência financeira
-  if (netMatch === false && poNetTotal !== null) {
-    reasons.push(
-      `Valor líquido da nota (${formatBRL(invoiceNetTotal)}) diverge do valor do pedido (${formatBRL(poNetTotal)})`
-    );
-  }
-
-  // Conferência de quantidades por item (Pedido x Nota)
-  if (itemEval && itemEval.itemReasons.length > 0) {
-    reasons.push(...itemEval.itemReasons);
+  if (missingRequiredReceipt) {
+    const missingReason =
+      'Recebimento Físico não sinalizado (obrigatório para liberar lançamento)';
+    return {
+      status: 'pendente_vinculo',
+      conferenceBadgeState:
+        hasUnreconciledItems
+          ? 'aguardando_conciliacao'
+          : reasons.length > 0
+          ? 'divergente'
+          : 'sem_divergencia',
+      reasons: [missingReason, ...reasons],
+      poGrossTotal: poGrossForComparison,
+      poTotal: expectedPoForComparison,
+      poFullTotal: poFullNetTotal,
+      invoiceGrossTotal,
+      invoiceTotal: invoiceNetTotal,
+      grossMatch,
+      netMatch,
+      financialComparison,
+      isPartialBilling,
+      qtyMatch: qtyOk,
+      unitPricesMatch: allUnitPricesMatch,
+      receivedQtyTotal,
+      orderedQtyTotal,
+      invoiceQtyTotal,
+      itemComparisons,
+      associations,
+      suggestions,
+      unmatchedInvoiceItemIndexes,
+      unmatchedPoItemIndexes,
+    };
   }
 
   return {
     status: reasons.length === 0 ? 'conciliada' : 'divergente',
+    conferenceBadgeState,
     reasons,
-    poGrossTotal,
-    poTotal: poNetTotal,
+    poGrossTotal: poGrossForComparison,
+    poTotal: expectedPoForComparison,
+    poFullTotal: poFullNetTotal,
     invoiceGrossTotal,
     invoiceTotal: invoiceNetTotal,
     grossMatch,
     netMatch,
+    financialComparison,
+    isPartialBilling,
     qtyMatch: qtyOk,
-    unitPricesMatch: itemEval ? itemEval.unitPricesMatch : true,
+    unitPricesMatch: allUnitPricesMatch,
     receivedQtyTotal,
     orderedQtyTotal,
     invoiceQtyTotal,
-    itemComparisons: itemEval ? itemEval.comparisons : [],
+    itemComparisons,
+    associations,
+    suggestions,
+    unmatchedInvoiceItemIndexes,
+    unmatchedPoItemIndexes,
   };
+}
+
+export function evaluatePreImportMatch(
+  params: Parameters<typeof evaluateThreeWayMatch>[0],
+  po?: PurchaseOrder,
+  options?: Omit<EvaluateMatchOptions, 'isPreImport'>
+): ThreeWayMatchDetails {
+  return evaluateThreeWayMatch(params, po, undefined, {
+    ...options,
+    isPreImport: true,
+  });
 }
 
 export function getPoReceptionSummary(

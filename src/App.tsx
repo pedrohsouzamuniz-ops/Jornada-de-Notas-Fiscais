@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   Building2,
   FileSpreadsheet,
-  LayoutDashboard,
   LogOut,
   Menu,
   PackageCheck,
@@ -13,15 +12,12 @@ import {
 } from 'lucide-react';
 import { AdminModule } from './components/AdminModule';
 import { ComprasModule } from './components/ComprasModule';
-import { DashboardModule } from './components/DashboardModule';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { FiscalModule } from './components/FiscalModule';
 import { LoginView, PendingAccessView } from './components/LoginView';
 import { RecebimentoModule } from './components/RecebimentoModule';
 import { P2PProvider, useP2P } from './context/P2PContext';
 import { NavModule, ROLE_LABELS } from './types/p2p';
-
-const DASHBOARD_ENABLED = false;
 
 const NAV_ITEMS: Array<{
   id: NavModule;
@@ -30,12 +26,6 @@ const NAV_ITEMS: Array<{
   icon: React.ComponentType<{ className?: string }>;
   adminOnly?: boolean;
 }> = [
-  {
-    id: 'dashboard',
-    label: 'Dashboard',
-    subtitle: 'Visão Geral P2P',
-    icon: LayoutDashboard,
-  },
   {
     id: 'compras',
     label: 'Compras',
@@ -65,9 +55,7 @@ const NAV_ITEMS: Array<{
 
 function WorkspaceShell() {
   const { authReady, firebaseUser, userProfile, isAdmin, logout, dataError } = useP2P();
-  const [activeModule, setActiveModule] = useState<NavModule>(
-  DASHBOARD_ENABLED ? 'dashboard' : 'fiscal'
-);
+  const [activeModule, setActiveModule] = useState<NavModule>('fiscal');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   if (!authReady) {
@@ -93,11 +81,7 @@ function WorkspaceShell() {
     return <PendingAccessView />;
   }
 
- const visibleNavItems = NAV_ITEMS.filter(
-  (item) =>
-    (DASHBOARD_ENABLED || item.id !== 'dashboard') &&
-    (!item.adminOnly || isAdmin)
-);
+  const visibleNavItems = NAV_ITEMS.filter((item) => !item.adminOnly || isAdmin);
   const currentMeta = NAV_ITEMS.find((i) => i.id === activeModule) || NAV_ITEMS[0];
 
   const handleSelectNav = (id: NavModule) => {
@@ -272,7 +256,6 @@ function WorkspaceShell() {
               </div>
             </div>
           )}
-          {DASHBOARD_ENABLED && activeModule === 'dashboard' && <DashboardModule onNavigate={handleSelectNav} />}
           {activeModule === 'compras' && <ComprasModule />}
           {activeModule === 'recebimento' && <RecebimentoModule />}
           {activeModule === 'fiscal' && <FiscalModule />}

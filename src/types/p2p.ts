@@ -130,6 +130,101 @@ export interface FiscalInvoiceItem {
   qty: number;
   unitPrice: number;
   totalPrice: number;
+  gtin?: string;
+}
+
+export type ItemMatchOrigin = 'smart' | 'equivalence' | 'manual';
+
+export interface FiscalItemAssociation {
+  id: string;
+  invoiceItemIndexes: number[];
+  poItemIndexes: number[];
+  conversionFactor: number;
+  origin: ItemMatchOrigin;
+  confidence?: number;
+  equivalenceId?: string;
+  confirmedByUid?: string;
+  confirmedByName?: string;
+  confirmedAt?: string;
+}
+
+export interface ProductEquivalence {
+  id: string;
+  supplierCnpj: string;
+  supplierItemCode: string;
+  supplierDescription: string;
+  supplierNormalizedDesc: string;
+  internalCode: string;
+  poDescription: string;
+  poUnit: string;
+  invoiceUnit: string;
+  conversionFactor: number;
+  active: boolean;
+  createdByUid: string;
+  createdByName: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
+export type AdjustmentRequestStatus =
+  | 'Ajuste solicitado'
+  | 'Em análise'
+  | 'Ajustado'
+  | 'Devolvido para revisão fiscal'
+  | 'Reaberto'
+  | 'Resolvido'
+  | 'Cancelado';
+
+export interface AdjustmentDivergentItemSnapshot {
+  invoiceItemDescription: string;
+  poItemDescription?: string;
+  poQty: number | null;
+  invoiceQty: number | null;
+  poUnitPrice: number | null;
+  invoiceUnitPrice: number | null;
+  reason: string;
+}
+
+export interface AdjustmentHistoryEntry {
+  status: AdjustmentRequestStatus;
+  actorUid: string;
+  actorName: string;
+  actorSector: string;
+  note: string;
+  timestamp: string;
+}
+
+export interface AdjustmentRequest {
+  id: string;
+  fiscalInvoiceId: string;
+  invoiceNumber: string;
+  docType: FiscalDocType;
+  supplierName: string;
+  supplierCnpj: string;
+  purchaseOrderId: string;
+  poNumber: string;
+  status: AdjustmentRequestStatus;
+  divergenceReasons: string[];
+  divergentItems: AdjustmentDivergentItemSnapshot[];
+  poGrossTotal: number;
+  poNetTotal: number;
+  invoiceGrossTotal: number;
+  invoiceNetTotal: number;
+  fiscalObservation: string;
+  requestedByUid: string;
+  requestedByName: string;
+  requestedAt: string;
+  comprasResponse?: string;
+  comprasRespondedByUid?: string;
+  comprasRespondedByName?: string;
+  comprasRespondedAt?: string;
+  resolvedByUid?: string;
+  resolvedByName?: string;
+  resolvedAt?: string;
+  resolutionNote?: string;
+  history: AdjustmentHistoryEntry[];
+  createdAt?: unknown;
+  updatedAt?: unknown;
 }
 
 export type MatchingStatus = 'pendente_vinculo' | 'conciliada' | 'divergente';
@@ -155,20 +250,29 @@ export interface FiscalInvoice {
   cfop: string;
   grossAmount: number;
   freightAmount: number;
+  insuranceAmount?: number;
+  otherExpensesAmount?: number;
+  surchargeAmount?: number;
   discountAmount?: number;
   totalProducts: number;
   icmsAmount: number;
   icmsDesonAmount?: number;
+  icmsStAmount?: number;
   ipiAmount: number;
   pisAmount: number;
   cofinsAmount: number;
+  csllAmount?: number;
   issqnAmount?: number;
+  issqnRetained?: boolean;
   inssAmount?: number;
   irrfAmount?: number;
+  retainedTaxesAmount?: number;
   taxRegime?: ServiceTaxRegime | '';
   totalInvoice: number;
+  xmlDeclaredTotal?: number;
   complementaryInfo?: string;
   items: FiscalInvoiceItem[];
+  itemAssociations?: FiscalItemAssociation[];
   purchaseOrderId: string;
   poNumber: string;
   receiptId: string;
@@ -185,6 +289,19 @@ export interface FiscalInvoice {
   suframaClearanceDate?: string;
   matchingStatus: MatchingStatus;
   fiscalStatus: FiscalStatus;
+  requiresPhysicalReceipt?: boolean;
+  isPartialBilling?: boolean;
+  conferenceStatus?: 'pendente' | 'conferido';
+  conferenceOriginalOutcome?: 'sem_divergencia' | 'divergente';
+  conferenceConfirmedByUid?: string;
+  conferenceConfirmedByName?: string;
+  conferenceConfirmedAt?: string;
+  conferenceJustification?: string;
+  conferenceDataVersion?: string;
+  pendingAdjustmentId?: string;
+  pendingAdjustmentPoId?: string;
+  pendingAdjustmentPoNumber?: string;
+  adjustmentStatus?: AdjustmentRequestStatus | '';
   replacedByInvoiceId?: string;
   replacedByInvoiceNumber?: string;
   bookkeepingDate: string;
@@ -215,12 +332,7 @@ export interface DeletionLog {
   createdAt?: unknown;
 }
 
-export type NavModule =
-  | 'dashboard'
-  | 'compras'
-  | 'recebimento'
-  | 'fiscal'
-  | 'administracao';
+export type NavModule = 'compras' | 'recebimento' | 'fiscal' | 'administracao';
 
 export const ROLE_LABELS: Record<UserRole, string> = {
   adm_titular: 'ADM Titular',
@@ -241,6 +353,9 @@ export const ROLE_TO_SECTOR: Record<UserRole, UserSector> = {
 // Volumetric boundaries synchronized with firebase-blueprint.json & firestore.rules
 export const BLUEPRINT_LIMITS = {
   MAX_ITEMS: 50,
+  MAX_ITEM_ASSOCIATIONS: 60,
+  MAX_ADJUSTMENT_REASONS: 30,
+  MAX_ADJUSTMENT_HISTORY: 40,
   MAX_PO_NUMBER: 40,
   MAX_RECEIPT_NUMBER: 40,
   MAX_SUPPLIER_NAME: 160,
@@ -249,6 +364,7 @@ export const BLUEPRINT_LIMITS = {
   MAX_PAYMENT_TERMS: 80,
   MAX_WAREHOUSE: 100,
   MAX_NOTES: 600,
+  MAX_JUSTIFICATION: 600,
   MAX_COMPLEMENTARY_INFO: 3000,
   MAX_ITEM_DESC: 200,
   MAX_USER_NAME: 120,

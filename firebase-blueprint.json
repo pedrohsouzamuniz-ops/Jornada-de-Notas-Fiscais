@@ -426,6 +426,15 @@
         "freightAmount": {
           "type": "number"
         },
+        "insuranceAmount": {
+          "type": "number"
+        },
+        "otherExpensesAmount": {
+          "type": "number"
+        },
+        "surchargeAmount": {
+          "type": "number"
+        },
         "discountAmount": {
           "type": "number"
         },
@@ -438,6 +447,9 @@
         "icmsDesonAmount": {
           "type": "number"
         },
+        "icmsStAmount": {
+          "type": "number"
+        },
         "ipiAmount": {
           "type": "number"
         },
@@ -447,13 +459,22 @@
         "cofinsAmount": {
           "type": "number"
         },
+        "csllAmount": {
+          "type": "number"
+        },
         "issqnAmount": {
           "type": "number"
+        },
+        "issqnRetained": {
+          "type": "boolean"
         },
         "inssAmount": {
           "type": "number"
         },
         "irrfAmount": {
+          "type": "number"
+        },
+        "retainedTaxesAmount": {
           "type": "number"
         },
         "taxRegime": {
@@ -463,6 +484,9 @@
         "totalInvoice": {
           "type": "number"
         },
+        "xmlDeclaredTotal": {
+          "type": "number"
+        },
         "complementaryInfo": {
           "type": "string",
           "maxLength": 3000
@@ -470,6 +494,10 @@
         "items": {
           "type": "array",
           "description": "Lista limitada (máximo 50 itens) extraídos do XML ou informados."
+        },
+        "itemAssociations": {
+          "type": "array",
+          "description": "Associações de itens (1:1, 1:N, N:1) e fatores de conversão entre XML e Pedido."
         },
         "purchaseOrderId": {
           "type": "string",
@@ -534,6 +562,65 @@
         "fiscalStatus": {
           "type": "string",
           "enum": ["aguardando_recebimento", "pendente", "lancado", "substituida", "aguardando_escrituracao", "escriturada", "rejeitada"]
+        },
+        "requiresPhysicalReceipt": {
+          "type": "boolean"
+        },
+        "isPartialBilling": {
+          "type": "boolean"
+        },
+        "conferenceStatus": {
+          "type": "string",
+          "enum": ["", "pendente", "conferido"]
+        },
+        "conferenceOriginalOutcome": {
+          "type": "string",
+          "enum": ["", "sem_divergencia", "divergente"]
+        },
+        "conferenceConfirmedByUid": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "conferenceConfirmedByName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "conferenceConfirmedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "conferenceJustification": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "conferenceDataVersion": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "pendingAdjustmentId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "pendingAdjustmentPoId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "pendingAdjustmentPoNumber": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "adjustmentStatus": {
+          "type": "string",
+          "enum": [
+            "",
+            "Ajuste solicitado",
+            "Em análise",
+            "Ajustado",
+            "Devolvido para revisão fiscal",
+            "Reaberto",
+            "Resolvido",
+            "Cancelado"
+          ]
         },
         "replacedByInvoiceId": {
           "type": "string",
@@ -603,6 +690,113 @@
         "notes",
         "createdByUid",
         "createdByName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ProductEquivalence": {
+      "title": "ProductEquivalence",
+      "description": "Equivalência salva de produto por fornecedor (CNPJ) para conciliação automática entre XML e Pedido de Compra.",
+      "type": "object",
+      "properties": {
+        "supplierCnpj": { "type": "string", "minLength": 11, "maxLength": 20 },
+        "supplierItemCode": { "type": "string", "maxLength": 40 },
+        "supplierDescription": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "supplierNormalizedDesc": { "type": "string", "maxLength": 200 },
+        "internalCode": { "type": "string", "maxLength": 40 },
+        "poDescription": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "poUnit": { "type": "string", "minLength": 1, "maxLength": 12 },
+        "invoiceUnit": { "type": "string", "minLength": 1, "maxLength": 12 },
+        "conversionFactor": { "type": "number" },
+        "active": { "type": "boolean" },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "supplierCnpj",
+        "supplierItemCode",
+        "supplierDescription",
+        "supplierNormalizedDesc",
+        "internalCode",
+        "poDescription",
+        "poUnit",
+        "invoiceUnit",
+        "conversionFactor",
+        "active",
+        "createdByUid",
+        "createdByName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdjustmentRequest": {
+      "title": "AdjustmentRequest",
+      "description": "Solicitação de ajuste enviada pelo setor Fiscal ao setor de Compras sem vincular prematuramente a nota ao Pedido.",
+      "type": "object",
+      "properties": {
+        "fiscalInvoiceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "invoiceNumber": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "docType": { "type": "string", "enum": ["NFE", "NFSE", "CTE"] },
+        "supplierName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "supplierCnpj": { "type": "string", "minLength": 11, "maxLength": 20 },
+        "purchaseOrderId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "poNumber": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "status": {
+          "type": "string",
+          "enum": [
+            "Ajuste solicitado",
+            "Em análise",
+            "Ajustado",
+            "Devolvido para revisão fiscal",
+            "Reaberto",
+            "Resolvido",
+            "Cancelado"
+          ]
+        },
+        "divergenceReasons": { "type": "array" },
+        "divergentItems": { "type": "array" },
+        "poGrossTotal": { "type": "number" },
+        "poNetTotal": { "type": "number" },
+        "invoiceGrossTotal": { "type": "number" },
+        "invoiceNetTotal": { "type": "number" },
+        "fiscalObservation": { "type": "string", "maxLength": 600 },
+        "requestedByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "requestedByName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "requestedAt": { "type": "string", "maxLength": 40 },
+        "comprasResponse": { "type": "string", "maxLength": 600 },
+        "comprasRespondedByUid": { "type": "string", "maxLength": 128 },
+        "comprasRespondedByName": { "type": "string", "maxLength": 120 },
+        "comprasRespondedAt": { "type": "string", "maxLength": 40 },
+        "resolvedByUid": { "type": "string", "maxLength": 128 },
+        "resolvedByName": { "type": "string", "maxLength": 120 },
+        "resolvedAt": { "type": "string", "maxLength": 40 },
+        "resolutionNote": { "type": "string", "maxLength": 600 },
+        "history": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "fiscalInvoiceId",
+        "invoiceNumber",
+        "docType",
+        "supplierName",
+        "supplierCnpj",
+        "purchaseOrderId",
+        "poNumber",
+        "status",
+        "divergenceReasons",
+        "divergentItems",
+        "poGrossTotal",
+        "poNetTotal",
+        "invoiceGrossTotal",
+        "invoiceNetTotal",
+        "fiscalObservation",
+        "requestedByUid",
+        "requestedByName",
+        "requestedAt",
+        "history",
         "createdAt",
         "updatedAt"
       ]
@@ -746,6 +940,14 @@
     "/fiscal_invoices/{invoiceId}": {
       "schema": { "$ref": "#/entities/FiscalInvoice" },
       "description": "Notas Fiscais e Escrituração do setor Fiscal."
+    },
+    "/product_equivalences/{eqId}": {
+      "schema": { "$ref": "#/entities/ProductEquivalence" },
+      "description": "Equivalências salvas de produto por fornecedor (CNPJ)."
+    },
+    "/adjustment_requests/{reqId}": {
+      "schema": { "$ref": "#/entities/AdjustmentRequest" },
+      "description": "Solicitações de ajuste de divergência entre Fiscal e Compras."
     },
     "/deletion_logs/{logId}": {
       "schema": { "$ref": "#/entities/DeletionLog" },

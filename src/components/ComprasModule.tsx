@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import { useP2P } from '../context/P2PContext';
 import {
+  AdjustmentRequest,
+  AdjustmentRequestStatus,
   BLUEPRINT_LIMITS,
   FiscalDocType,
   FiscalInvoice,
@@ -38,6 +40,7 @@ export function ComprasModule() {
     purchaseOrders,
     physicalReceipts,
     fiscalInvoices,
+    adjustmentRequests,
     canAccessSectorData,
     canCreateInSector,
     canEditInSector,
@@ -47,6 +50,7 @@ export function ComprasModule() {
     createPurchaseOrder,
     updatePurchaseOrder,
     deletePurchaseOrder,
+    respondAdjustmentRequestAsCompras,
     dataLoading,
   } = useP2P();
 
@@ -56,7 +60,12 @@ export function ComprasModule() {
   const canDelete = canDeleteInSector('compras');
 
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'todos' | PurchaseOrderStatus>('todos');
+  const [statusFilter, setStatusFilter] = useState<
+    'todos' | PurchaseOrderStatus | 'ajuste_solicitado'
+  >('todos');
+  const [adjustmentNotes, setAdjustmentNotes] = useState<Record<string, string>>({});
+  const [respondingAdjId, setRespondingAdjId] = useState<string | null>(null);
+  const [adjustmentError, setAdjustmentError] = useState<string | null>(null);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingOrder, setEditingOrder] = useState<PurchaseOrder | null>(null);
@@ -83,10 +92,27 @@ export function ComprasModule() {
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  const activeAdjustmentsByPo = useMemo(() => {
+    const map = new Map<string, AdjustmentRequest[]>();
+    adjustmentRequests.forEach((req) => {
+      if (req.status === 'Resolvido' || req.status === 'Cancelado') return;
+      const list = map.get(req.purchaseOrderId) || [];
+      list.push(req);
+      map.set(req.purchaseOrderId, list);
+    });
+    return map;
+  }, [adjustmentRequests]);
+
+  const posWithActiveAdjustmentCount = activeAdjustmentsByPo.size;
+
   const filteredOrders = useMemo(() => {
     const q = search.trim().toLowerCase();
     return purchaseOrders.filter((po) => {
-      if (statusFilter !== 'todos' && po.status !== statusFilter) return false;
+      if (statusFilter === 'ajuste_solicitado') {
+        if ((activeAdjustmentsByPo.get(po.id)?.length || 0) === 0) return false;
+      } else if (statusFilter !== 'todos' && po.status !== statusFilter) {
+        return false;
+      }
       if (!q) return true;
       return (
         po.poNumber.toLowerCase().includes(q) ||
@@ -95,7 +121,7 @@ export function ComprasModule() {
         po.costCenter.toLowerCase().includes(q)
       );
     });
-  }, [purchaseOrders, search, statusFilter]);
+  }, [purchaseOrders, search, statusFilter, activeAdjustmentsByPo]);
 
   const linkedInvoicesByPo = useMemo(() => {
     const map = new Map<string, number>();
@@ -117,6 +143,14 @@ export function ComprasModule() {
 
     const poReceipts = physicalReceipts.filter((r) => r.purchaseOrderId === detailOrder.id);
     const poInvoices = fiscalInvoices.filter((f) => f.purchaseOrderId === detailOrder.id);
+    const poAdjustments = adjustmentRequests
+      .filter((req) => req.purchaseOrderId === detailOrder.id)
+      .sort((a, b) => {
+        const activeA = a.status !== 'Resolvido' && a.status !== 'Cancelado' ? 0 : 1;
+        const activeB = b.status !== 'Resolvido' && b.status !== 'Cancelado' ? 0 : 1;
+        if (activeA !== activeB) return activeA - activeB;
+        return (b.requestedAt || '').localeCompare(a.requestedAt || '');
+      });
 
     const receivedByItemKey = new Map<string, number>();
     const receivedByDesc = new Map<string, number>();
@@ -131,20 +165,28 @@ export function ComprasModule() {
 
     const summary = getPoReceptionSummary(detailOrder, physicalReceipts);
 
-    type OrderHistoryEntry = {
+    type OrderLaunchRow = {
       id: string;
-      date: string;
+      sortDate: string;
+      receiptDateText: string;
+      invoiceNumberText: string;
+      itemDescription: string;
+      invoiceQtyText: string;
+      unitPrice: number | null;
+      invoiceTotal: number | null;
+      isMultiItemInvoice: boolean;
       invoice?: FiscalInvoice;
       receipt?: PhysicalReceipt;
-      invoiceLabel: string;
-      totalQty: number;
-      itemsBreakdown: Array<{ description: string; qty: number; unit: string }>;
-      invoiceTotal: number | null;
-      responsibleName: string;
+    };
+
+    const docTypeLabel: Record<FiscalDocType, string> = {
+      NFE: 'NF-e',
+      NFSE: 'NFS-e',
+      CTE: 'CT-e',
     };
 
     const usedInvoiceIds = new Set<string>();
-    const entries: OrderHistoryEntry[] = [];
+    const rows: OrderLaunchRow[] = [];
 
     poReceipts.forEach((rec) => {
       const matchedInv =
@@ -156,74 +198,138 @@ export function ComprasModule() {
 
       if (matchedInv) {
         usedInvoiceIds.add(matchedInv.id);
+        const invItems =
+          matchedInv.items.length > 0
+            ? matchedInv.items
+            : [
+                {
+                  code: '',
+                  description: `${docTypeLabel[matchedInv.docType || 'NFE']} ${matchedInv.nfeNumber}`,
+                  ncm: '',
+                  cfop: matchedInv.cfop,
+                  unit: 'UN',
+                  qty: 1,
+                  unitPrice: matchedInv.totalInvoice,
+                  totalPrice: matchedInv.totalInvoice,
+                },
+              ];
+
+        invItems.forEach((it, idx) => {
+          rows.push({
+            id: `rec_${rec.id}_inv_${matchedInv.id}_${idx}`,
+            sortDate: rec.receiptDate || matchedInv.issueDate,
+            receiptDateText: rec.receiptDate ? formatDateBR(rec.receiptDate) : '—',
+            invoiceNumberText: `${docTypeLabel[matchedInv.docType || 'NFE']} ${matchedInv.nfeNumber}`,
+            itemDescription: it.description,
+            invoiceQtyText: `${Number(it.qty || 0)} ${it.unit || 'UN'}`,
+            unitPrice: Number(it.unitPrice ?? 0),
+            invoiceTotal: matchedInv.totalInvoice,
+            isMultiItemInvoice: invItems.length > 1,
+            invoice: matchedInv,
+            receipt: rec,
+          });
+        });
+      } else {
+        const activeItems = rec.items.filter((it) => Number(it.qtyReceived || 0) > 0);
+        const itemsToShow = activeItems.length > 0 ? activeItems : rec.items;
+        itemsToShow.forEach((it, idx) => {
+          rows.push({
+            id: `rec_${rec.id}_item_${idx}`,
+            sortDate: rec.receiptDate,
+            receiptDateText: rec.receiptDate ? formatDateBR(rec.receiptDate) : '—',
+            invoiceNumberText: rec.invoiceNumberRef ? `NF ${rec.invoiceNumberRef}` : 'Sem NF vinculada',
+            itemDescription: it.description,
+            invoiceQtyText: `${Number(it.qtyReceived || 0)} ${it.unit || 'UN'}`,
+            unitPrice: null,
+            invoiceTotal: null,
+            isMultiItemInvoice: false,
+            receipt: rec,
+          });
+        });
       }
-
-      const activeItems = rec.items.filter((it) => Number(it.qtyReceived || 0) > 0);
-      const itemsToShow = activeItems.length > 0 ? activeItems : rec.items;
-      const totalQty = rec.items.reduce((s, it) => s + Number(it.qtyReceived || 0), 0);
-
-      const docTypeLabel: Record<FiscalDocType, string> = {
-        NFE: 'NF-e',
-        NFSE: 'NFS-e',
-        CTE: 'CT-e',
-      };
-      const invoiceLabel = matchedInv
-        ? `${docTypeLabel[matchedInv.docType || 'NFE']} ${matchedInv.nfeNumber}`
-        : rec.invoiceNumberRef
-        ? `NF ${rec.invoiceNumberRef}`
-        : 'Sem NF vinculada';
-
-      entries.push({
-        id: `rec_${rec.id}`,
-        date: rec.receiptDate,
-        invoice: matchedInv,
-        receipt: rec,
-        invoiceLabel,
-        totalQty,
-        itemsBreakdown: itemsToShow.map((it) => ({
-          description: it.description,
-          qty: Number(it.qtyReceived || 0),
-          unit: it.unit || 'UN',
-        })),
-        invoiceTotal: matchedInv ? matchedInv.totalInvoice : null,
-        responsibleName: rec.receivedByName,
-      });
     });
 
     poInvoices
       .filter((inv) => !usedInvoiceIds.has(inv.id))
       .forEach((inv) => {
-        const docTypeLabel: Record<FiscalDocType, string> = {
-          NFE: 'NF-e',
-          NFSE: 'NFS-e',
-          CTE: 'CT-e',
-        };
-        const totalQty = inv.items.reduce((s, it) => s + Number(it.qty || 0), 0);
-        entries.push({
-          id: `inv_${inv.id}`,
-          date: inv.bookkeepingDate || inv.issueDate,
-          invoice: inv,
-          invoiceLabel: `${docTypeLabel[inv.docType || 'NFE']} ${inv.nfeNumber}`,
-          totalQty,
-          itemsBreakdown: inv.items.map((it) => ({
-            description: it.description,
-            qty: Number(it.qty || 0),
-            unit: it.unit || 'UN',
-          })),
-          invoiceTotal: inv.totalInvoice,
-          responsibleName: inv.createdByName,
+        const invItems =
+          inv.items.length > 0
+            ? inv.items
+            : [
+                {
+                  code: '',
+                  description: `${docTypeLabel[inv.docType || 'NFE']} ${inv.nfeNumber}`,
+                  ncm: '',
+                  cfop: inv.cfop,
+                  unit: 'UN',
+                  qty: 1,
+                  unitPrice: inv.totalInvoice,
+                  totalPrice: inv.totalInvoice,
+                },
+              ];
+
+        const linkedRec = inv.receiptId
+          ? poReceipts.find((r) => r.id === inv.receiptId)
+          : undefined;
+        const receiptDateText = linkedRec?.receiptDate
+          ? formatDateBR(linkedRec.receiptDate)
+          : inv.requiresPhysicalReceipt === false
+          ? inv.bookkeepingDate
+            ? formatDateBR(inv.bookkeepingDate)
+            : 'Sem receb. físico'
+          : 'Aguardando doca';
+
+        invItems.forEach((it, idx) => {
+          rows.push({
+            id: `inv_${inv.id}_${idx}`,
+            sortDate: linkedRec?.receiptDate || inv.bookkeepingDate || inv.issueDate,
+            receiptDateText,
+            invoiceNumberText: `${docTypeLabel[inv.docType || 'NFE']} ${inv.nfeNumber}`,
+            itemDescription: it.description,
+            invoiceQtyText: `${Number(it.qty || 0)} ${it.unit || 'UN'}`,
+            unitPrice: Number(it.unitPrice ?? 0),
+            invoiceTotal: inv.totalInvoice,
+            isMultiItemInvoice: invItems.length > 1,
+            invoice: inv,
+            receipt: linkedRec,
+          });
         });
       });
 
-    entries.sort((a, b) => a.date.localeCompare(b.date));
+    rows.sort((a, b) => a.sortDate.localeCompare(b.sortDate));
 
     return {
       summary,
       receivedByItemKey,
       receivedByDesc,
-      entries,
+      entries: rows,
+      poAdjustments,
     };
-  }, [detailOrder, physicalReceipts, fiscalInvoices]);
+  }, [detailOrder, physicalReceipts, fiscalInvoices, adjustmentRequests]);
+
+  const handleRespondAdjustment = async (
+    req: AdjustmentRequest,
+    nextStatus: Extract<
+      AdjustmentRequestStatus,
+      'Em análise' | 'Ajustado' | 'Devolvido para revisão fiscal'
+    >
+  ) => {
+    setAdjustmentError(null);
+    setRespondingAdjId(req.id);
+    try {
+      const note = adjustmentNotes[req.id] || '';
+      await respondAdjustmentRequestAsCompras(req.id, nextStatus, note);
+      setActionSuccess(
+        `Solicitação de ajuste da ${req.invoiceNumber} atualizada para "${nextStatus}".`
+      );
+    } catch (err) {
+      setAdjustmentError(
+        err instanceof Error ? err.message : 'Erro ao responder solicitação de ajuste.'
+      );
+    } finally {
+      setRespondingAdjId(null);
+    }
+  };
 
   const openCreateModal = () => {
     const nextSeq = String(purchaseOrders.length + 1).padStart(4, '0');
@@ -479,6 +585,13 @@ export function ComprasModule() {
               { id: 'aberto', label: 'Aberto' },
               { id: 'parcialmente_atendido', label: 'Parcialmente Atendido' },
               { id: 'concluido', label: 'Concluído' },
+              {
+                id: 'ajuste_solicitado',
+                label:
+                  posWithActiveAdjustmentCount > 0
+                    ? `Com solicitação de ajuste (${posWithActiveAdjustmentCount})`
+                    : 'Com solicitação de ajuste',
+              },
             ] as const
           ).map((tab) => (
             <button
@@ -488,6 +601,8 @@ export function ComprasModule() {
               className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap ${
                 statusFilter === tab.id
                   ? 'bg-white text-slate-900 shadow-xs'
+                  : tab.id === 'ajuste_solicitado' && posWithActiveAdjustmentCount > 0
+                  ? 'text-amber-800 bg-amber-50 hover:bg-amber-100'
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
@@ -560,6 +675,16 @@ export function ComprasModule() {
                         <div className="text-xs text-slate-500 tabular-nums">
                           {formatDateBR(po.issueDate)} · {po.items.length} item(ns)
                         </div>
+                        {(activeAdjustmentsByPo.get(po.id)?.length || 0) > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setDetailOrder(po)}
+                            className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-[11px] font-semibold text-amber-800 hover:bg-amber-100 cursor-pointer"
+                          >
+                            <AlertCircle className="w-3 h-3" />
+                            Ajuste solicitado ({activeAdjustmentsByPo.get(po.id)?.length})
+                          </button>
+                        )}
                       </td>
                       <td className="py-3 px-4">
                         <div className="text-xs font-medium text-slate-900 max-w-[240px] truncate">
@@ -1146,7 +1271,7 @@ export function ComprasModule() {
                 </div>
               </div>
 
-              {/* Histórico de Lançamentos / Entradas do Pedido */}
+              {/* Histórico de Lançamentos no Pedido */}
               <div className="space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
@@ -1167,11 +1292,12 @@ export function ComprasModule() {
                       <table className="w-full text-left border-collapse text-xs">
                         <thead>
                           <tr className="bg-slate-50 border-b border-slate-200 text-slate-500">
-                            <th className="py-2 px-3">Data</th>
-                            <th className="py-2 px-3">Nota Fiscal / Rec.</th>
-                            <th className="py-2 px-3">Itens & Quantidade Lançada</th>
-                            <th className="py-2 px-3 text-right">Qtd Total</th>
-                            <th className="py-2 px-3 text-right">Valor Nota</th>
+                            <th className="py-2 px-3">Data de recebimento</th>
+                            <th className="py-2 px-3">Nº da Nota Fiscal</th>
+                            <th className="py-2 px-3">Item</th>
+                            <th className="py-2 px-3 text-right">Qtd. da Nota Fiscal</th>
+                            <th className="py-2 px-3 text-right">Valor unitário</th>
+                            <th className="py-2 px-3 text-right">Valor total da Nota Fiscal</th>
                             <th className="py-2 px-3">Situação</th>
                           </tr>
                         </thead>
@@ -1201,37 +1327,27 @@ export function ComprasModule() {
                             return (
                               <tr key={entry.id} className="hover:bg-slate-50/70 align-top">
                                 <td className="py-2.5 px-3 font-mono tabular-nums whitespace-nowrap text-slate-900">
-                                  {formatDateBR(entry.date)}
+                                  {entry.receiptDateText}
                                 </td>
-                                <td className="py-2.5 px-3 whitespace-nowrap">
-                                  <div className="font-mono font-semibold text-slate-900">
-                                    {entry.invoiceLabel}
-                                  </div>
-                                  <div className="text-[11px] text-slate-500 font-mono">
-                                    {entry.receipt
-                                      ? `${entry.receipt.receiptNumber} · ${entry.responsibleName}`
-                                      : `Vínculo Fiscal · ${entry.responsibleName}`}
-                                  </div>
+                                <td className="py-2.5 px-3 font-mono font-semibold text-slate-900 whitespace-nowrap">
+                                  {entry.invoiceNumberText}
                                 </td>
-                                <td className="py-2.5 px-3 min-w-[200px]">
-                                  <ul className="space-y-0.5 text-slate-700">
-                                    {entry.itemsBreakdown.map((it, i) => (
-                                      <li key={i} className="flex items-baseline justify-between gap-2">
-                                        <span className="truncate max-w-[190px]" title={it.description}>
-                                          {it.description}
-                                        </span>
-                                        <span className="font-mono font-medium text-slate-900 tabular-nums whitespace-nowrap">
-                                          {it.qty} {it.unit}
-                                        </span>
-                                      </li>
-                                    ))}
-                                  </ul>
+                                <td className="py-2.5 px-3 text-slate-800 min-w-[180px]">
+                                  {entry.itemDescription}
                                 </td>
-                                <td className="py-2.5 px-3 text-right font-mono font-semibold text-slate-900 tabular-nums whitespace-nowrap">
-                                  {entry.totalQty}
+                                <td className="py-2.5 px-3 text-right font-mono font-medium text-slate-900 tabular-nums whitespace-nowrap">
+                                  {entry.invoiceQtyText}
+                                </td>
+                                <td className="py-2.5 px-3 text-right font-mono tabular-nums whitespace-nowrap text-slate-700">
+                                  {entry.unitPrice !== null ? formatBRL(entry.unitPrice) : '—'}
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono tabular-nums whitespace-nowrap text-slate-900">
                                   {entry.invoiceTotal !== null ? formatBRL(entry.invoiceTotal) : '—'}
+                                  {entry.isMultiItemInvoice && (
+                                    <span className="block text-[10px] font-sans text-slate-400">
+                                      Total da NF
+                                    </span>
+                                  )}
                                 </td>
                                 <td className="py-2.5 px-3 whitespace-nowrap">
                                   <StatusTag label={badgeInfo.label} tone={badgeInfo.tone} />
@@ -1256,6 +1372,205 @@ export function ComprasModule() {
                   </div>
                 )}
               </div>
+
+              {/* Solicitações de Ajuste enviadas pelo Fiscal */}
+              {detailOrderTracking.poAdjustments.length > 0 && (
+                <div className="space-y-3 pt-4 border-t border-slate-200">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                      Solicitações de Ajuste (Fiscal → Compras) ({detailOrderTracking.poAdjustments.length})
+                    </h3>
+                    <span className="text-xs text-slate-500">
+                      Trate as divergências no Pedido e responda ao Fiscal
+                    </span>
+                  </div>
+
+                  {adjustmentError && (
+                    <div className="p-3 rounded-lg bg-red-50 border border-red-200 text-xs text-red-700">
+                      {adjustmentError}
+                    </div>
+                  )}
+
+                  <div className="space-y-3">
+                    {detailOrderTracking.poAdjustments.map((req) => {
+                      const isActiveReq =
+                        req.status !== 'Resolvido' && req.status !== 'Cancelado';
+                      const statusTone: 'warning' | 'info' | 'success' | 'danger' | 'neutral' =
+                        req.status === 'Resolvido'
+                          ? 'success'
+                          : req.status === 'Cancelado'
+                          ? 'neutral'
+                          : req.status === 'Ajustado'
+                          ? 'info'
+                          : req.status === 'Devolvido para revisão fiscal'
+                          ? 'danger'
+                          : 'warning';
+
+                      return (
+                        <div
+                          key={req.id}
+                          className={`p-4 rounded-xl border text-xs space-y-3 ${
+                            isActiveReq
+                              ? 'bg-amber-50/40 border-amber-300'
+                              : 'bg-slate-50 border-slate-200'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <span className="font-mono font-semibold text-slate-900">
+                                {req.docType} {req.invoiceNumber}
+                              </span>{' '}
+                              <span className="text-slate-500">
+                                · Solicitado por {req.requestedByName} em{' '}
+                                {formatDateBR(req.requestedAt.slice(0, 10))}
+                              </span>
+                            </div>
+                            <StatusTag label={req.status} tone={statusTone} />
+                          </div>
+
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 p-2.5 bg-white border border-slate-200 rounded-lg tabular-nums">
+                            <div>
+                              <span className="text-[11px] text-slate-500 block">Bruto Pedido</span>
+                              <span className="font-mono font-semibold text-slate-900">
+                                {formatBRL(req.poGrossTotal)}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[11px] text-slate-500 block">Bruto Nota</span>
+                              <span className="font-mono font-semibold text-slate-900">
+                                {formatBRL(req.invoiceGrossTotal)}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[11px] text-slate-500 block">Líquido Pedido</span>
+                              <span className="font-mono font-semibold text-slate-900">
+                                {formatBRL(req.poNetTotal)}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-[11px] text-slate-500 block">Líquido Nota</span>
+                              <span className="font-mono font-semibold text-slate-900">
+                                {formatBRL(req.invoiceNetTotal)}
+                              </span>
+                            </div>
+                          </div>
+
+                          {req.divergenceReasons.length > 0 && (
+                            <ul className="list-disc pl-4 text-amber-900 space-y-0.5">
+                              {req.divergenceReasons.map((reason, idx) => (
+                                <li key={idx}>{reason}</li>
+                              ))}
+                            </ul>
+                          )}
+
+                          {req.divergentItems.length > 0 && (
+                            <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+                              <table className="w-full text-left border-collapse text-[11px]">
+                                <thead>
+                                  <tr className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                                    <th className="py-1.5 px-2.5">Item (Nota / Pedido)</th>
+                                    <th className="py-1.5 px-2.5 text-right">Qtd Ped × NF</th>
+                                    <th className="py-1.5 px-2.5 text-right">Unit. Ped × NF</th>
+                                    <th className="py-1.5 px-2.5">Divergência</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100 tabular-nums">
+                                  {req.divergentItems.map((it, idx) => (
+                                    <tr key={idx}>
+                                      <td className="py-1.5 px-2.5 text-slate-800">
+                                        {it.invoiceItemDescription}
+                                        {it.poItemDescription &&
+                                          it.poItemDescription !== it.invoiceItemDescription && (
+                                            <span className="block text-slate-500">
+                                              PO: {it.poItemDescription}
+                                            </span>
+                                          )}
+                                      </td>
+                                      <td className="py-1.5 px-2.5 text-right font-mono">
+                                        {it.poQty ?? '—'} × {it.invoiceQty ?? '—'}
+                                      </td>
+                                      <td className="py-1.5 px-2.5 text-right font-mono">
+                                        {it.poUnitPrice !== null ? formatBRL(it.poUnitPrice) : '—'} ×{' '}
+                                        {it.invoiceUnitPrice !== null
+                                          ? formatBRL(it.invoiceUnitPrice)
+                                          : '—'}
+                                      </td>
+                                      <td className="py-1.5 px-2.5 text-amber-800">{it.reason}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+
+                          {req.fiscalObservation && (
+                            <div className="p-2.5 rounded-lg bg-white border border-slate-200 text-slate-700">
+                              <span className="font-semibold text-slate-900">Obs. Fiscal:</span>{' '}
+                              {req.fiscalObservation}
+                            </div>
+                          )}
+
+                          {req.comprasResponse && (
+                            <div className="p-2.5 rounded-lg bg-blue-50 border border-blue-200 text-blue-900">
+                              <span className="font-semibold">Última resposta Compras:</span>{' '}
+                              {req.comprasResponse}
+                            </div>
+                          )}
+
+                          {canEdit && isActiveReq && (
+                            <div className="space-y-2 pt-2 border-t border-amber-200/70">
+                              <textarea
+                                rows={2}
+                                maxLength={BLUEPRINT_LIMITS.MAX_NOTES}
+                                value={adjustmentNotes[req.id] ?? req.comprasResponse ?? ''}
+                                onChange={(e) =>
+                                  setAdjustmentNotes((prev) => ({
+                                    ...prev,
+                                    [req.id]: e.target.value,
+                                  }))
+                                }
+                                placeholder="Registre o parecer ou ajuste realizado no Pedido de Compra para retorno ao Fiscal..."
+                                className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg"
+                              />
+                              <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                  type="button"
+                                  disabled={respondingAdjId === req.id}
+                                  onClick={() => void handleRespondAdjustment(req, 'Em análise')}
+                                  className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+                                >
+                                  Iniciar análise
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={respondingAdjId === req.id}
+                                  onClick={() => void handleRespondAdjustment(req, 'Ajustado')}
+                                  className="px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg disabled:opacity-50 cursor-pointer"
+                                >
+                                  Marcar como ajustado
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={respondingAdjId === req.id}
+                                  onClick={() =>
+                                    void handleRespondAdjustment(
+                                      req,
+                                      'Devolvido para revisão fiscal'
+                                    )
+                                  }
+                                  className="px-3 py-1.5 text-xs font-medium text-amber-900 bg-amber-100 hover:bg-amber-200 rounded-lg disabled:opacity-50 cursor-pointer"
+                                >
+                                  Devolver para revisão fiscal
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {!isAdmin &&
                 fiscalInvoices.some((f) => f.purchaseOrderId === detailOrder.id) && (

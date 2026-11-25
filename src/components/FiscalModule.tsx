@@ -3,14 +3,17 @@ import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import {
   AlertTriangle,
+  BookmarkCheck,
   CheckCircle2,
   Copy,
   Download,
   FileCode2,
   FileSpreadsheet,
   FileText,
+  Layers,
   Link2Off,
   Lock,
+  MessageSquareWarning,
   Plus,
   Printer,
   Search,
@@ -24,7 +27,9 @@ import {
   FiscalDocType,
   FiscalInvoice,
   FiscalInvoiceItem,
+  FiscalItemAssociation,
   FiscalStatus,
+  ProductEquivalence,
   SERVICE_TAX_REGIME_LABELS,
   ServiceTaxRegime,
 } from '../types/p2p';
@@ -34,6 +39,12 @@ import {
   getFallbackCitiesForUf,
   getUfFromCodeOrAccessKey,
 } from '../utils/brazilLocations';
+import { exportFiscalInvoicesToExcel } from '../utils/excelExport';
+import {
+  buildConferenceFingerprint,
+  calculateFiscalNetTotal,
+  formatFiscalActionError,
+} from '../utils/fiscalCalculations';
 import {
   formatAccessKeyShort,
   formatBRL,
@@ -43,7 +54,12 @@ import {
   normalizeCnpjDigits,
   todayISO,
 } from '../utils/formatters';
-import { evaluateThreeWayMatch, getPoReceptionSummary } from '../utils/matching';
+import {
+  ThreeWayMatchDetails,
+  evaluatePreImportMatch,
+  evaluateThreeWayMatch,
+  getPoReceptionSummary,
+} from '../utils/matching';
 import {
   ParsedFiscalXml,
   buildSampleCTeXml,
@@ -52,6 +68,8 @@ import {
   parseFiscalXml,
 } from '../utils/nfeXmlParser';
 import { DeleteAuthModal } from './DeleteAuthModal';
+import { FiscalEquivalencesModal } from './FiscalEquivalencesModal';
+import { EquivalenceDraftInput, ItemReconciliationEditor } from './ItemReconciliationEditor';
 import { StatusTag } from './StatusBadge';
 
 interface BatchXmlItem {
@@ -60,10 +78,19 @@ interface BatchXmlItem {
   parsed?: ParsedFiscalXml;
   error?: string;
   duplicate?: boolean;
+  requiresPhysicalReceipt: boolean;
+  initialFiscalStatus: 'aguardando_recebimento' | 'pendente';
+  isPartialBilling: boolean;
   purchaseOrderId: string;
   receiptId: string;
   linkedInvoiceId: string;
   notes: string;
+  itemAssociations?: FiscalItemAssociation[];
+  pendingEquivalences?: EquivalenceDraftInput[];
+  conferenceConfirmed?: boolean;
+  conferenceJustification?: string;
+  notifyCompras?: boolean;
+  adjustmentObservation?: string;
 }
 
 const DOC_TYPE_LABELS: Record<FiscalDocType, string> = {
@@ -78,14 +105,20 @@ export function FiscalModule() {
     purchaseOrders,
     physicalReceipts,
     fiscalInvoices,
+    productEquivalences,
+    adjustmentRequests,
     canAccessSectorData,
     canCreateInSector,
     canEditInSector,
     canDeleteInSector,
     isAdmin,
     deletionPasswordConfigured,
-    createFiscalInvoice,
+    createFiscalInvoicesBatch,
     updateFiscalInvoice,
+    confirmInvoiceConference,
+    upsertProductEquivalence,
+    createAdjustmentRequest,
+    updateAdjustmentRequestAsFiscal,
     unlinkFiscalInvoice,
     deleteFiscalInvoice,
     dataLoading,
@@ -98,7 +131,9 @@ export function FiscalModule() {
 
   const [subTab, setSubTab] = useState<'controle' | 'importar'>('controle');
   const [search, setSearch] = useState('');
-  const [fiscalFilter, setFiscalFilter] = useState<'todos' | FiscalStatus>('todos');
+  const [fiscalFilter, setFiscalFilter] = useState<
+    'todos' | FiscalStatus | 'aguardando_ajuste'
+  >('todos');
   const [competenceFilter, setCompetenceFilter] = useState('');
   const [bookingDateFilter, setBookingDateFilter] = useState('');
   const [interstateFilter, setInterstateFilter] = useState<'todos' | 'fora' | 'pin_pendente'>('todos');
@@ -107,6 +142,7 @@ export function FiscalModule() {
     return localStorage.getItem('p2p_company_uf') || 'AM';
   });
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [equivalencesModalOpen, setEquivalencesModalOpen] = useState(false);
 
   // Print Report Modal state
   const [reportModalOpen, setReportModalOpen] = useState(false);
@@ -124,21 +160,40 @@ export function FiscalModule() {
   const [batchError, setBatchError] = useState<string | null>(null);
   const [batchSuccess, setBatchSuccess] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [previewBatchItem, setPreviewBatchItem] = useState<BatchXmlItem | null>(null);
+  const [previewBatchItemId, setPreviewBatchItemId] = useState<string | null>(null);
 
   // Reconciliation / Bookkeeping Ficha modal state
   const [activeInvoice, setActiveInvoice] = useState<FiscalInvoice | null>(null);
   const [linkPoId, setLinkPoId] = useState('');
   const [linkReceiptId, setLinkReceiptId] = useState('');
+  const [editRequiresPhysicalReceipt, setEditRequiresPhysicalReceipt] = useState<boolean>(true);
+  const [editIsPartialBilling, setEditIsPartialBilling] = useState<boolean>(false);
+  const [editItemAssociations, setEditItemAssociations] = useState<FiscalItemAssociation[]>([]);
+  const [confJustificationInput, setConfJustificationInput] = useState('');
+  const [adjObservationInput, setAdjObservationInput] = useState('');
+  const [fiscalResolutionNote, setFiscalResolutionNote] = useState('');
   const [editNotes, setEditNotes] = useState('');
   const [editFiscalStatus, setEditFiscalStatus] =
     useState<FiscalStatus>('aguardando_recebimento');
   const [editBookkeepingDate, setEditBookkeepingDate] = useState('');
   const [replacedByInvoiceId, setReplacedByInvoiceId] = useState('');
   const [editTaxRegime, setEditTaxRegime] = useState<ServiceTaxRegime>('simples_nacional');
+  const [editTotalProducts, setEditTotalProducts] = useState<number>(0);
+  const [editFreightAmount, setEditFreightAmount] = useState<number>(0);
+  const [editInsuranceAmount, setEditInsuranceAmount] = useState<number>(0);
+  const [editOtherExpensesAmount, setEditOtherExpensesAmount] = useState<number>(0);
+  const [editSurchargeAmount, setEditSurchargeAmount] = useState<number>(0);
+  const [editDiscountAmount, setEditDiscountAmount] = useState<number>(0);
+  const [editIcmsAmount, setEditIcmsAmount] = useState<number>(0);
+  const [editIcmsDesonAmount, setEditIcmsDesonAmount] = useState<number>(0);
+  const [editIcmsStAmount, setEditIcmsStAmount] = useState<number>(0);
+  const [editIpiAmount, setEditIpiAmount] = useState<number>(0);
+  const [editRetainedTaxesAmount, setEditRetainedTaxesAmount] = useState<number>(0);
   const [editPisAmount, setEditPisAmount] = useState<number>(0);
   const [editCofinsAmount, setEditCofinsAmount] = useState<number>(0);
+  const [editCsllAmount, setEditCsllAmount] = useState<number>(0);
   const [editIssqnAmount, setEditIssqnAmount] = useState<number>(0);
+  const [editIssqnRetained, setEditIssqnRetained] = useState<boolean>(true);
   const [editInssAmount, setEditInssAmount] = useState<number>(0);
   const [editIrrfAmount, setEditIrrfAmount] = useState<number>(0);
   const [editLinkedInvoiceId, setEditLinkedInvoiceId] = useState('');
@@ -152,6 +207,7 @@ export function FiscalModule() {
   const [editSuframaPinReceiptDate, setEditSuframaPinReceiptDate] = useState('');
   const [editSuframaClearanceDate, setEditSuframaClearanceDate] = useState('');
   const [modalError, setModalError] = useState<string | null>(null);
+  const [modalSuccess, setModalSuccess] = useState<string | null>(null);
 
   const [deleteTarget, setDeleteTarget] = useState<FiscalInvoice | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
@@ -167,16 +223,25 @@ export function FiscalModule() {
   const [manualIssuerName, setManualIssuerName] = useState('');
   const [manualIssuerCnpj, setManualIssuerCnpj] = useState('');
   const [manualPoId, setManualPoId] = useState('');
-  const [manualFiscalStatus, setManualFiscalStatus] =
-    useState<'aguardando_recebimento' | 'pendente'>('aguardando_recebimento');
+  const [manualRequiresPhysicalReceipt, setManualRequiresPhysicalReceipt] = useState<boolean>(true);
+  const [manualIsPartialBilling, setManualIsPartialBilling] = useState<boolean>(false);
+  const [manualNotifyCompras, setManualNotifyCompras] = useState<boolean>(false);
+  const [manualAdjObservation, setManualAdjObservation] = useState('');
   const [manualFreightAmount, setManualFreightAmount] = useState<number>(0);
+  const [manualInsuranceAmount, setManualInsuranceAmount] = useState<number>(0);
+  const [manualOtherExpensesAmount, setManualOtherExpensesAmount] = useState<number>(0);
+  const [manualSurchargeAmount, setManualSurchargeAmount] = useState<number>(0);
   const [manualDiscountAmount, setManualDiscountAmount] = useState<number>(0);
   const [manualIcmsAmount, setManualIcmsAmount] = useState<number>(0);
   const [manualIcmsDesonAmount, setManualIcmsDesonAmount] = useState<number>(0);
+  const [manualIcmsStAmount, setManualIcmsStAmount] = useState<number>(0);
   const [manualIpiAmount, setManualIpiAmount] = useState<number>(0);
+  const [manualRetainedTaxesAmount, setManualRetainedTaxesAmount] = useState<number>(0);
   const [manualPisAmount, setManualPisAmount] = useState<number>(0);
   const [manualCofinsAmount, setManualCofinsAmount] = useState<number>(0);
+  const [manualCsllAmount, setManualCsllAmount] = useState<number>(0);
   const [manualIssqnAmount, setManualIssqnAmount] = useState<number>(0);
+  const [manualIssqnRetained, setManualIssqnRetained] = useState<boolean>(true);
   const [manualInssAmount, setManualInssAmount] = useState<number>(0);
   const [manualIrrfAmount, setManualIrrfAmount] = useState<number>(0);
   const [manualTaxRegime, setManualTaxRegime] =
@@ -191,7 +256,6 @@ export function FiscalModule() {
   const [manualSuframaPinAcceptanceDate, setManualSuframaPinAcceptanceDate] = useState('');
   const [manualSuframaPinReceiptDate, setManualSuframaPinReceiptDate] = useState('');
   const [manualSuframaClearanceDate, setManualSuframaClearanceDate] = useState('');
-  const [manualTotalOverride, setManualTotalOverride] = useState<string>('');
   const [manualComplementaryInfo, setManualComplementaryInfo] = useState('');
   const [manualNotes, setManualNotes] = useState('');
   const [manualItems, setManualItems] = useState<FiscalInvoiceItem[]>([
@@ -303,7 +367,18 @@ export function FiscalModule() {
   const filteredInvoices = useMemo(() => {
     const q = search.trim().toLowerCase();
     return fiscalInvoices.filter((inv) => {
-      if (fiscalFilter !== 'todos') {
+      if (fiscalFilter === 'aguardando_ajuste') {
+        const hasActiveAdj = Boolean(
+          inv.pendingAdjustmentId ||
+            adjustmentRequests.some(
+              (r) =>
+                r.fiscalInvoiceId === inv.id &&
+                r.status !== 'Resolvido' &&
+                r.status !== 'Cancelado'
+            )
+        );
+        if (!hasActiveAdj) return false;
+      } else if (fiscalFilter !== 'todos') {
         if (fiscalFilter === 'pendente') {
           if (
             inv.fiscalStatus !== 'pendente' &&
@@ -346,6 +421,7 @@ export function FiscalModule() {
     });
   }, [
     fiscalInvoices,
+    adjustmentRequests,
     search,
     fiscalFilter,
     interstateFilter,
@@ -662,6 +738,12 @@ export function FiscalModule() {
     ).length;
     const outOfStateNfeCount = fiscalInvoices.filter((f) => isOutOfStateNfe(f)).length;
     const pendingSuframaCount = fiscalInvoices.filter((f) => hasPendingSuframa(f)).length;
+    const activeAdjustmentsCount = adjustmentRequests.filter(
+      (r) => r.status !== 'Resolvido' && r.status !== 'Cancelado'
+    ).length;
+    const awaitingRevisionAdjustmentsCount = adjustmentRequests.filter(
+      (r) => r.status === 'Ajustado' || r.status === 'Devolvido para revisão fiscal'
+    ).length;
     return {
       totalValue,
       totalFreight,
@@ -671,8 +753,10 @@ export function FiscalModule() {
       replacedCount,
       outOfStateNfeCount,
       pendingSuframaCount,
+      activeAdjustmentsCount,
+      awaitingRevisionAdjustmentsCount,
     };
-  }, [fiscalInvoices, companyUf]);
+  }, [fiscalInvoices, adjustmentRequests, companyUf]);
 
   const getEligiblePurchaseOrdersForCnpj = (
     issuerCnpj: string,
@@ -725,6 +809,9 @@ export function FiscalModule() {
             parsed,
             duplicate: true,
             error: 'Chave de Acesso já existente no Controle Fiscal ou na fila atual.',
+            requiresPhysicalReceipt: true,
+            initialFiscalStatus: 'aguardando_recebimento',
+            isPartialBilling: false,
             purchaseOrderId: '',
             receiptId: '',
             linkedInvoiceId: '',
@@ -743,6 +830,9 @@ export function FiscalModule() {
           fileName: entry.fileName,
           parsed,
           duplicate: false,
+          requiresPhysicalReceipt: true,
+          initialFiscalStatus: 'aguardando_recebimento',
+          isPartialBilling: false,
           purchaseOrderId: '',
           receiptId: '',
           linkedInvoiceId: matchedRefInvoice?.id || '',
@@ -753,6 +843,9 @@ export function FiscalModule() {
           id: itemId,
           fileName: entry.fileName,
           error: err instanceof Error ? err.message : 'Falha na leitura do XML.',
+          requiresPhysicalReceipt: true,
+          initialFiscalStatus: 'aguardando_recebimento',
+          isPartialBilling: false,
           purchaseOrderId: '',
           receiptId: '',
           linkedInvoiceId: '',
@@ -809,17 +902,48 @@ export function FiscalModule() {
     ]);
   };
 
-  const updateBatchItemLink = (
-    id: string,
-    field: 'purchaseOrderId' | 'receiptId' | 'linkedInvoiceId' | 'notes',
-    value: string
-  ) => {
+  const updateBatchItem = (id: string, patch: Partial<BatchXmlItem>) => {
     setBatchQueue((prev) =>
-      prev.map((item) => (item.id === id ? { ...item, [field]: value } : item))
+      prev.map((item) => {
+        if (item.id !== id) return item;
+        const next: BatchXmlItem = { ...item, ...patch };
+        // Invalidate provisional conference confirmation whenever structural conference data changes
+        if (
+          patch.purchaseOrderId !== undefined ||
+          patch.requiresPhysicalReceipt !== undefined ||
+          patch.isPartialBilling !== undefined ||
+          patch.itemAssociations !== undefined
+        ) {
+          next.conferenceConfirmed = false;
+          next.conferenceJustification = '';
+        }
+        if (patch.purchaseOrderId !== undefined && patch.purchaseOrderId !== item.purchaseOrderId) {
+          next.itemAssociations = undefined;
+          next.notifyCompras = false;
+          next.adjustmentObservation = '';
+        }
+        return next;
+      })
+    );
+  };
+
+  const applyBatchRequiresPhysicalReceiptAll = (requiresPhysical: boolean) => {
+    const nextStatus: 'aguardando_recebimento' | 'pendente' = requiresPhysical
+      ? 'aguardando_recebimento'
+      : 'pendente';
+    setBatchQueue((prev) =>
+      prev.map((item) => ({
+        ...item,
+        requiresPhysicalReceipt: requiresPhysical,
+        initialFiscalStatus: nextStatus,
+        conferenceConfirmed: false,
+        conferenceJustification: '',
+      }))
     );
   };
 
   const removeBatchItem = (id: string) => {
+    if (previewBatchItemId === id) setPreviewBatchItemId(null);
     setBatchQueue((prev) => prev.filter((item) => item.id !== id));
   };
 
@@ -828,14 +952,173 @@ export function FiscalModule() {
     [batchQueue]
   );
 
+  const previewBatchItem = useMemo(
+    () => batchQueue.find((b) => b.id === previewBatchItemId) || null,
+    [batchQueue, previewBatchItemId]
+  );
+
+  const computeParsedEffectiveValues = (parsed: ParsedFiscalXml) => {
+    const effectiveTaxRegime: ServiceTaxRegime | '' =
+      parsed.docType === 'NFSE' ? parsed.taxRegime || 'simples_nacional' : '';
+    const effectivePis =
+      parsed.docType === 'NFSE' && effectiveTaxRegime !== 'regime_normal' ? 0 : parsed.pisAmount;
+    const effectiveCofins =
+      parsed.docType === 'NFSE' && effectiveTaxRegime !== 'regime_normal'
+        ? 0
+        : parsed.cofinsAmount;
+    const effectiveCsll =
+      parsed.docType === 'NFSE' && effectiveTaxRegime !== 'regime_normal'
+        ? 0
+        : parsed.csllAmount || 0;
+    const effectiveIssqn =
+      parsed.docType === 'NFSE' && effectiveTaxRegime === 'mei' ? 0 : parsed.issqnAmount || 0;
+    const effectiveInss =
+      parsed.docType === 'NFSE' && effectiveTaxRegime === 'mei' ? 0 : parsed.inssAmount || 0;
+    const effectiveIrrf =
+      parsed.docType === 'NFSE' && effectiveTaxRegime !== 'regime_normal'
+        ? 0
+        : parsed.irrfAmount || 0;
+
+    const computedNetTotal = calculateFiscalNetTotal({
+      docType: parsed.docType,
+      totalProducts: parsed.totalProducts,
+      freightAmount: parsed.freightAmount,
+      insuranceAmount: parsed.insuranceAmount || 0,
+      otherExpensesAmount: parsed.otherExpensesAmount || 0,
+      surchargeAmount: parsed.surchargeAmount || 0,
+      ipiAmount: parsed.ipiAmount,
+      icmsStAmount: parsed.icmsStAmount,
+      discountAmount: parsed.discountAmount,
+      retainedTaxesAmount: parsed.retainedTaxesAmount,
+      taxRegime: effectiveTaxRegime,
+      pisAmount: effectivePis,
+      cofinsAmount: effectiveCofins,
+      csllAmount: effectiveCsll,
+      issqnAmount: effectiveIssqn,
+      issqnRetained: parsed.issqnRetained ?? true,
+      inssAmount: effectiveInss,
+      irrfAmount: effectiveIrrf,
+    });
+
+    return {
+      effectiveTaxRegime,
+      effectivePis,
+      effectiveCofins,
+      effectiveCsll,
+      effectiveIssqn,
+      effectiveInss,
+      effectiveIrrf,
+      computedNetTotal,
+    };
+  };
+
+  // Pre-import provisional conference evaluation for all valid XML queue items with PO linked
+  const preImportMatchMap = useMemo(() => {
+    const map = new Map<string, ThreeWayMatchDetails>();
+    validBatchItems.forEach((item) => {
+      const parsed = item.parsed!;
+      const po = purchaseOrders.find((p) => p.id === item.purchaseOrderId);
+      const { computedNetTotal } = computeParsedEffectiveValues(parsed);
+
+      const tempEquivs: ProductEquivalence[] = (item.pendingEquivalences || []).map((draft, i) => ({
+        id: `temp_eq_${item.id}_${i}`,
+        supplierCnpj: draft.supplierCnpj,
+        supplierItemCode: draft.supplierItemCode,
+        supplierDescription: draft.supplierDescription,
+        supplierNormalizedDesc: draft.supplierDescription,
+        internalCode: draft.internalCode,
+        poDescription: draft.poDescription,
+        poUnit: draft.poUnit,
+        invoiceUnit: draft.invoiceUnit,
+        conversionFactor: draft.conversionFactor,
+        active: true,
+        createdByUid: 'temp',
+        createdByName: 'temp',
+      }));
+
+      const savedOtherForPo = po
+        ? fiscalInvoices
+            .filter((f) => f.purchaseOrderId === po.id)
+            .map((f) => ({
+              id: f.id,
+              docType: f.docType,
+              grossAmount: f.grossAmount,
+              totalProducts: f.totalProducts,
+              totalInvoice: f.totalInvoice,
+              discountAmount: f.discountAmount,
+              otherExpensesAmount: f.otherExpensesAmount,
+              surchargeAmount: f.surchargeAmount,
+              items: f.items,
+              itemAssociations: f.itemAssociations,
+            }))
+        : [];
+
+      const batchSiblingForPo = po
+        ? validBatchItems
+            .filter(
+              (other) =>
+                other.id !== item.id &&
+                other.purchaseOrderId === po.id &&
+                !other.notifyCompras &&
+                other.parsed
+            )
+            .map((other) => {
+              const othParsed = other.parsed!;
+              const othVals = computeParsedEffectiveValues(othParsed);
+              return {
+                id: other.id,
+                docType: othParsed.docType,
+                grossAmount: othParsed.grossAmount,
+                totalProducts: othParsed.totalProducts,
+                totalInvoice: othVals.computedNetTotal,
+                discountAmount: othParsed.discountAmount,
+                otherExpensesAmount: othParsed.otherExpensesAmount,
+                surchargeAmount: othParsed.surchargeAmount,
+                items: othParsed.items,
+                itemAssociations: other.itemAssociations,
+              };
+            })
+        : [];
+
+      const match = evaluatePreImportMatch(
+        {
+          id: item.id,
+          docType: parsed.docType,
+          issuerCnpj: parsed.issuerCnpj,
+          grossAmount: parsed.grossAmount,
+          totalProducts: parsed.totalProducts,
+          discountAmount: parsed.discountAmount,
+          otherExpensesAmount: parsed.otherExpensesAmount,
+          surchargeAmount: parsed.surchargeAmount,
+          totalInvoice: computedNetTotal,
+          items: parsed.items,
+          itemAssociations: item.itemAssociations,
+          purchaseOrderId: po?.id || '',
+          receiptId: '',
+          requiresPhysicalReceipt: item.requiresPhysicalReceipt,
+          isPartialBilling: item.isPartialBilling,
+        },
+        po,
+        {
+          savedEquivalences: [...productEquivalences, ...tempEquivs],
+          otherLinkedInvoicesForPo: [...savedOtherForPo, ...batchSiblingForPo],
+        }
+      );
+      map.set(item.id, match);
+    });
+    return map;
+  }, [validBatchItems, purchaseOrders, fiscalInvoices, productEquivalences]);
+
   const handleImportBatch = async () => {
     if (validBatchItems.length === 0) return;
     setBatchError(null);
     setBatchSuccess(null);
     setSaving(true);
-    let importedCount = 0;
 
     try {
+      const entries: Parameters<typeof createFiscalInvoicesBatch>[0] = [];
+      const equivalencesToPersist: EquivalenceDraftInput[] = [];
+
       for (const item of validBatchItems) {
         const parsed = item.parsed!;
         const po = purchaseOrders.find((p) => p.id === item.purchaseOrderId);
@@ -855,71 +1138,172 @@ export function FiscalModule() {
             );
           }
         }
-        const rec = physicalReceipts.find((r) => r.id === item.receiptId);
+
         const linkedInv =
           parsed.docType === 'CTE' && item.linkedInvoiceId
             ? fiscalInvoices.find((f) => f.id === item.linkedInvoiceId)
             : undefined;
-        const match = evaluateThreeWayMatch(
-          {
-            issuerCnpj: parsed.issuerCnpj,
+        const requiresPhysicalReceipt = item.requiresPhysicalReceipt;
+        const initialFiscalStatus: 'aguardando_recebimento' | 'pendente' = requiresPhysicalReceipt
+          ? 'aguardando_recebimento'
+          : 'pendente';
+
+        const {
+          effectiveTaxRegime,
+          effectivePis,
+          effectiveCofins,
+          effectiveCsll,
+          effectiveIssqn,
+          effectiveInss,
+          effectiveIrrf,
+          computedNetTotal,
+        } = computeParsedEffectiveValues(parsed);
+
+        const match = preImportMatchMap.get(item.id);
+        const associations = match?.associations || item.itemAssociations || [];
+        const fingerprint = buildConferenceFingerprint({
+          invoice: {
+            docType: parsed.docType,
             grossAmount: parsed.grossAmount,
             totalProducts: parsed.totalProducts,
-            totalInvoice: parsed.totalInvoice,
+            freightAmount: parsed.freightAmount,
+            insuranceAmount: parsed.insuranceAmount || 0,
+            otherExpensesAmount: parsed.otherExpensesAmount || 0,
+            surchargeAmount: parsed.surchargeAmount || 0,
+            discountAmount: parsed.discountAmount || 0,
+            ipiAmount: parsed.ipiAmount,
+            icmsStAmount: parsed.icmsStAmount || 0,
+            pisAmount: effectivePis,
+            cofinsAmount: effectiveCofins,
+            csllAmount: effectiveCsll,
+            issqnAmount: effectiveIssqn,
+            issqnRetained: parsed.issqnRetained ?? true,
+            inssAmount: effectiveInss,
+            irrfAmount: effectiveIrrf,
+            retainedTaxesAmount: parsed.retainedTaxesAmount || 0,
+            taxRegime: effectiveTaxRegime,
+            totalInvoice: computedNetTotal,
             items: parsed.items,
-            purchaseOrderId: po?.id || '',
-            receiptId: rec?.id || '',
           },
           po,
-          rec
-        );
-
-        await createFiscalInvoice({
-          ...parsed,
-          series: parsed.docType === 'NFSE' ? 'NFS' : parsed.series,
-          issuerState: (parsed.issuerState || '').trim().toUpperCase(),
-          suframaPinNumber: '',
-          suframaPinAcceptanceDate: '',
-          suframaPinReceiptDate: '',
-          suframaClearanceDate: '',
-          taxRegime: parsed.docType === 'NFSE' ? parsed.taxRegime || 'simples_nacional' : '',
-          pisAmount:
-            parsed.docType === 'NFSE' && parsed.taxRegime === 'mei' ? 0 : parsed.pisAmount,
-          cofinsAmount:
-            parsed.docType === 'NFSE' && parsed.taxRegime === 'mei' ? 0 : parsed.cofinsAmount,
-          issqnAmount:
-            parsed.docType === 'NFSE' && parsed.taxRegime === 'mei' ? 0 : parsed.issqnAmount,
-          inssAmount:
-            parsed.docType === 'NFSE' && parsed.taxRegime === 'mei' ? 0 : parsed.inssAmount,
-          irrfAmount:
-            parsed.docType === 'NFSE' && parsed.taxRegime === 'mei' ? 0 : parsed.irrfAmount,
-          linkedInvoiceId: linkedInv?.id || '',
-          linkedInvoiceNumber: linkedInv?.nfeNumber || '',
-          originState: parsed.docType === 'CTE' ? parsed.originState || '' : '',
-          originCity: parsed.docType === 'CTE' ? parsed.originCity || '' : '',
-          destinationState: parsed.docType === 'CTE' ? parsed.destinationState || '' : '',
-          destinationCity: parsed.docType === 'CTE' ? parsed.destinationCity || '' : '',
-          purchaseOrderId: po?.id || '',
-          poNumber: po?.poNumber || '',
-          receiptId: rec?.id || '',
-          receiptNumber: rec?.receiptNumber || '',
-          matchingStatus: match.status,
-          fiscalStatus: 'aguardando_recebimento',
-          bookkeepingDate: '',
-          xmlImported: true,
-          notes: item.notes.trim(),
+          itemAssociations: associations,
+          requiresPhysicalReceipt,
+          isPartialBilling: item.isPartialBilling,
         });
-        importedCount += 1;
+
+        const shouldSendAdjustment = Boolean(item.notifyCompras && po);
+        const confConfirmed = Boolean(item.conferenceConfirmed && !shouldSendAdjustment);
+
+        const divergentItemsSnapshot = (match?.itemComparisons || [])
+          .filter((cmp) => !cmp.matchedInPo || !cmp.qtyMatch || !cmp.unitPriceMatch)
+          .map((cmp) => ({
+            invoiceItemDescription: cmp.description,
+            ...(cmp.poDescription ? { poItemDescription: cmp.poDescription } : {}),
+            poQty: cmp.poQty,
+            invoiceQty: cmp.invoiceQty,
+            poUnitPrice: cmp.poUnitPrice,
+            invoiceUnitPrice: cmp.invoiceUnitPrice,
+            reason: !cmp.matchedInPo
+              ? 'Item não conciliado no Pedido'
+              : !cmp.qtyMatch
+              ? 'Quantidade divergente'
+              : 'Valor unitário divergente',
+          }));
+
+        if (item.pendingEquivalences?.length) {
+          equivalencesToPersist.push(...item.pendingEquivalences);
+        }
+
+        entries.push({
+          invoiceData: {
+            ...parsed,
+            series: parsed.docType === 'NFSE' ? parsed.series || '' : parsed.series || '1',
+            issuerState: (parsed.issuerState || '').trim().toUpperCase(),
+            suframaPinNumber: '',
+            suframaPinAcceptanceDate: '',
+            suframaPinReceiptDate: '',
+            suframaClearanceDate: '',
+            taxRegime: effectiveTaxRegime,
+            pisAmount: effectivePis,
+            cofinsAmount: effectiveCofins,
+            csllAmount: effectiveCsll,
+            issqnAmount: effectiveIssqn,
+            issqnRetained: parsed.issqnRetained ?? true,
+            inssAmount: effectiveInss,
+            irrfAmount: effectiveIrrf,
+            icmsStAmount: parsed.icmsStAmount || 0,
+            retainedTaxesAmount: parsed.retainedTaxesAmount || 0,
+            totalInvoice: computedNetTotal,
+            itemAssociations: associations,
+            linkedInvoiceId: linkedInv?.id || '',
+            linkedInvoiceNumber: linkedInv?.nfeNumber || '',
+            originState: parsed.docType === 'CTE' ? parsed.originState || '' : '',
+            originCity: parsed.docType === 'CTE' ? parsed.originCity || '' : '',
+            destinationState: parsed.docType === 'CTE' ? parsed.destinationState || '' : '',
+            destinationCity: parsed.docType === 'CTE' ? parsed.destinationCity || '' : '',
+            purchaseOrderId: shouldSendAdjustment ? '' : po?.id || '',
+            poNumber: shouldSendAdjustment ? '' : po?.poNumber || '',
+            receiptId: '',
+            receiptNumber: '',
+            matchingStatus: shouldSendAdjustment
+              ? 'pendente_vinculo'
+              : match?.status || 'pendente_vinculo',
+            fiscalStatus: initialFiscalStatus,
+            requiresPhysicalReceipt,
+            isPartialBilling: item.isPartialBilling,
+            ...(confConfirmed
+              ? {
+                  conferenceStatus: 'conferido' as const,
+                  conferenceOriginalOutcome:
+                    match?.conferenceBadgeState === 'sem_divergencia'
+                      ? ('sem_divergencia' as const)
+                      : ('divergente' as const),
+                  conferenceConfirmedByUid: userProfile?.uid || '',
+                  conferenceConfirmedByName: userProfile?.name || '',
+                  conferenceConfirmedAt: new Date().toISOString(),
+                  conferenceJustification: item.conferenceJustification || '',
+                  conferenceDataVersion: fingerprint,
+                }
+              : {
+                  conferenceStatus: 'pendente' as const,
+                }),
+            bookkeepingDate: '',
+            xmlImported: true,
+            notes: item.notes.trim(),
+          },
+          ...(shouldSendAdjustment && po
+            ? {
+                adjustmentRequest: {
+                  po,
+                  divergenceReasons: match?.reasons || ['Divergência sinalizada na pré-importação'],
+                  divergentItems: divergentItemsSnapshot,
+                  poGrossTotal: match?.poGrossTotal ?? po.totalAmount,
+                  poNetTotal: match?.poTotal ?? po.totalAmount,
+                  invoiceGrossTotal: parsed.grossAmount,
+                  invoiceNetTotal: computedNetTotal,
+                  fiscalObservation: item.adjustmentObservation || '',
+                },
+              }
+            : {}),
+        });
+      }
+
+      await createFiscalInvoicesBatch(entries);
+
+      // Persist any queued supplier product equivalences after confirmed batch import
+      for (const eq of equivalencesToPersist) {
+        await upsertProductEquivalence(eq);
       }
 
       setBatchQueue([]);
+      setPreviewBatchItemId(null);
       setBatchSuccess(
-        `${importedCount} documento(s) fiscal(is) importado(s) com status inicial "Aguardando Recebimento".`
+        `${entries.length} documento(s) fiscal(is) importado(s) com sucesso.`
       );
       setSubTab('controle');
     } catch (err) {
       setBatchError(
-        err instanceof Error ? err.message : 'Falha ao importar documentos XML no banco.'
+        formatFiscalActionError(err, 'Falha ao importar documentos XML no banco.')
       );
     } finally {
       setSaving(false);
@@ -930,6 +1314,12 @@ export function FiscalModule() {
     setActiveInvoice(inv);
     setLinkPoId(inv.purchaseOrderId);
     setLinkReceiptId(inv.receiptId);
+    setEditRequiresPhysicalReceipt(inv.requiresPhysicalReceipt ?? true);
+    setEditIsPartialBilling(Boolean(inv.isPartialBilling));
+    setEditItemAssociations(inv.itemAssociations || []);
+    setConfJustificationInput(inv.conferenceJustification || '');
+    setAdjObservationInput('');
+    setFiscalResolutionNote('');
     setEditNotes(inv.notes || '');
     const normalizedStatus: FiscalStatus =
       inv.fiscalStatus === 'aguardando_escrituracao'
@@ -941,9 +1331,22 @@ export function FiscalModule() {
     setEditBookkeepingDate(inv.bookkeepingDate || '');
     setReplacedByInvoiceId(inv.replacedByInvoiceId || '');
     setEditTaxRegime((inv.taxRegime as ServiceTaxRegime) || 'simples_nacional');
+    setEditTotalProducts(Number(inv.totalProducts ?? inv.grossAmount ?? 0));
+    setEditFreightAmount(Number(inv.freightAmount || 0));
+    setEditInsuranceAmount(Number(inv.insuranceAmount || 0));
+    setEditOtherExpensesAmount(Number(inv.otherExpensesAmount || 0));
+    setEditSurchargeAmount(Number(inv.surchargeAmount || 0));
+    setEditDiscountAmount(Number(inv.discountAmount || 0));
+    setEditIcmsAmount(Number(inv.icmsAmount || 0));
+    setEditIcmsDesonAmount(Number(inv.icmsDesonAmount || 0));
+    setEditIcmsStAmount(Number(inv.icmsStAmount || 0));
+    setEditIpiAmount(Number(inv.ipiAmount || 0));
+    setEditRetainedTaxesAmount(Number(inv.retainedTaxesAmount || 0));
     setEditPisAmount(Number(inv.pisAmount || 0));
     setEditCofinsAmount(Number(inv.cofinsAmount || 0));
+    setEditCsllAmount(Number(inv.csllAmount || 0));
     setEditIssqnAmount(Number(inv.issqnAmount || 0));
+    setEditIssqnRetained(inv.issqnRetained ?? true);
     setEditInssAmount(Number(inv.inssAmount || 0));
     setEditIrrfAmount(Number(inv.irrfAmount || 0));
     setEditLinkedInvoiceId(inv.linkedInvoiceId || '');
@@ -957,6 +1360,7 @@ export function FiscalModule() {
     setEditSuframaPinReceiptDate(inv.suframaPinReceiptDate || '');
     setEditSuframaClearanceDate(inv.suframaClearanceDate || '');
     setModalError(null);
+    setModalSuccess(null);
   };
 
   const canEditActiveInvoice = useMemo(() => {
@@ -966,6 +1370,71 @@ export function FiscalModule() {
       activeInvoice.fiscalStatus === 'escriturada';
     return canEdit && (isAdmin || !isBooked);
   }, [activeInvoice, canEdit, isAdmin]);
+
+  const activeAdjustmentRequest = useMemo(() => {
+    if (!activeInvoice) return undefined;
+    return adjustmentRequests.find(
+      (r) =>
+        r.fiscalInvoiceId === activeInvoice.id &&
+        r.status !== 'Resolvido' &&
+        r.status !== 'Cancelado'
+    );
+  }, [activeInvoice, adjustmentRequests]);
+
+  const canToggleActivePhysicalReceipt = useMemo(() => {
+    if (!activeInvoice || !canEditActiveInvoice) return false;
+    const isAlreadyLaunched =
+      activeInvoice.fiscalStatus === 'lancado' ||
+      activeInvoice.fiscalStatus === 'escriturada';
+    if (isAlreadyLaunched) return false;
+    if (Boolean(activeInvoice.receiptId) || Boolean(linkReceiptId)) return false;
+    return true;
+  }, [activeInvoice, canEditActiveInvoice, linkReceiptId]);
+
+  const requiresReceiptForActive = editRequiresPhysicalReceipt;
+
+  const editComputedTotal = useMemo(() => {
+    if (!activeInvoice) return 0;
+    return calculateFiscalNetTotal({
+      docType: activeInvoice.docType || 'NFE',
+      totalProducts: editTotalProducts,
+      freightAmount: editFreightAmount,
+      insuranceAmount: editInsuranceAmount,
+      otherExpensesAmount: editOtherExpensesAmount,
+      surchargeAmount: editSurchargeAmount,
+      ipiAmount: editIpiAmount,
+      icmsStAmount: editIcmsStAmount,
+      discountAmount: editDiscountAmount,
+      retainedTaxesAmount: editRetainedTaxesAmount,
+      taxRegime: activeInvoice.docType === 'NFSE' ? editTaxRegime : '',
+      pisAmount: editPisAmount,
+      cofinsAmount: editCofinsAmount,
+      csllAmount: editCsllAmount,
+      issqnAmount: editIssqnAmount,
+      issqnRetained: editIssqnRetained,
+      inssAmount: editInssAmount,
+      irrfAmount: editIrrfAmount,
+    });
+  }, [
+    activeInvoice,
+    editTotalProducts,
+    editFreightAmount,
+    editInsuranceAmount,
+    editOtherExpensesAmount,
+    editSurchargeAmount,
+    editIpiAmount,
+    editIcmsStAmount,
+    editDiscountAmount,
+    editRetainedTaxesAmount,
+    editTaxRegime,
+    editPisAmount,
+    editCofinsAmount,
+    editCsllAmount,
+    editIssqnAmount,
+    editIssqnRetained,
+    editInssAmount,
+    editIrrfAmount,
+  ]);
 
   const pendingReplacementCandidates = useMemo(() => {
     if (!activeInvoice) return [];
@@ -988,10 +1457,38 @@ export function FiscalModule() {
       });
   }, [activeInvoice, fiscalInvoices]);
 
+  const hasLinkedPo = useMemo(
+    () => Boolean(linkPoId && purchaseOrders.some((p) => p.id === linkPoId)),
+    [linkPoId, purchaseOrders]
+  );
+
   const hasSignaledReceipt = useMemo(
     () => Boolean(linkReceiptId && physicalReceipts.some((r) => r.id === linkReceiptId)),
     [linkReceiptId, physicalReceipts]
   );
+
+  const canLaunchActive = useMemo(
+    () => hasLinkedPo && (!requiresReceiptForActive || hasSignaledReceipt),
+    [hasLinkedPo, requiresReceiptForActive, hasSignaledReceipt]
+  );
+
+  const otherLinkedForActivePo = useMemo(() => {
+    if (!activeInvoice || !linkPoId) return [];
+    return fiscalInvoices
+      .filter((f) => f.id !== activeInvoice.id && f.purchaseOrderId === linkPoId)
+      .map((f) => ({
+        id: f.id,
+        docType: f.docType,
+        grossAmount: f.grossAmount,
+        totalProducts: f.totalProducts,
+        totalInvoice: f.totalInvoice,
+        discountAmount: f.discountAmount,
+        otherExpensesAmount: f.otherExpensesAmount,
+        surchargeAmount: f.surchargeAmount,
+        items: f.items,
+        itemAssociations: f.itemAssociations,
+      }));
+  }, [activeInvoice, linkPoId, fiscalInvoices]);
 
   const modalMatchPreview = useMemo(() => {
     if (!activeInvoice) return null;
@@ -999,30 +1496,458 @@ export function FiscalModule() {
     const rec = physicalReceipts.find((r) => r.id === linkReceiptId);
     return evaluateThreeWayMatch(
       {
+        id: activeInvoice.id,
+        docType: activeInvoice.docType || 'NFE',
         issuerCnpj: activeInvoice.issuerCnpj,
-        grossAmount: activeInvoice.grossAmount ?? activeInvoice.totalProducts,
-        totalProducts: activeInvoice.totalProducts,
-        totalInvoice: activeInvoice.totalInvoice,
+        grossAmount: editTotalProducts,
+        totalProducts: editTotalProducts,
+        discountAmount: editDiscountAmount,
+        otherExpensesAmount: editOtherExpensesAmount,
+        surchargeAmount: editSurchargeAmount,
+        totalInvoice: editComputedTotal,
         items: activeInvoice.items,
+        itemAssociations: editItemAssociations,
         purchaseOrderId: linkPoId,
         receiptId: linkReceiptId,
+        requiresPhysicalReceipt: requiresReceiptForActive,
+        isPartialBilling: editIsPartialBilling,
+        pendingAdjustmentId: activeAdjustmentRequest?.id || '',
       },
       po,
-      rec
+      rec,
+      {
+        savedEquivalences: productEquivalences,
+        otherLinkedInvoicesForPo: otherLinkedForActivePo,
+      }
     );
-  }, [activeInvoice, linkPoId, linkReceiptId, purchaseOrders, physicalReceipts]);
+  }, [
+    activeInvoice,
+    linkPoId,
+    linkReceiptId,
+    editTotalProducts,
+    editDiscountAmount,
+    editOtherExpensesAmount,
+    editSurchargeAmount,
+    editComputedTotal,
+    editItemAssociations,
+    requiresReceiptForActive,
+    editIsPartialBilling,
+    activeAdjustmentRequest,
+    purchaseOrders,
+    physicalReceipts,
+    productEquivalences,
+    otherLinkedForActivePo,
+  ]);
+
+  const adjustmentPreviewMatch = useMemo(() => {
+    if (!activeInvoice || !activeAdjustmentRequest) return null;
+    const reqPo = purchaseOrders.find((p) => p.id === activeAdjustmentRequest.purchaseOrderId);
+    if (!reqPo) return null;
+    const otherForReqPo = fiscalInvoices
+      .filter((f) => f.id !== activeInvoice.id && f.purchaseOrderId === reqPo.id)
+      .map((f) => ({
+        id: f.id,
+        docType: f.docType,
+        grossAmount: f.grossAmount,
+        totalProducts: f.totalProducts,
+        totalInvoice: f.totalInvoice,
+        discountAmount: f.discountAmount,
+        otherExpensesAmount: f.otherExpensesAmount,
+        surchargeAmount: f.surchargeAmount,
+        items: f.items,
+        itemAssociations: f.itemAssociations,
+      }));
+    return evaluatePreImportMatch(
+      {
+        id: activeInvoice.id,
+        docType: activeInvoice.docType || 'NFE',
+        issuerCnpj: activeInvoice.issuerCnpj,
+        grossAmount: editTotalProducts,
+        totalProducts: editTotalProducts,
+        discountAmount: editDiscountAmount,
+        otherExpensesAmount: editOtherExpensesAmount,
+        surchargeAmount: editSurchargeAmount,
+        totalInvoice: editComputedTotal,
+        items: activeInvoice.items,
+        itemAssociations: editItemAssociations,
+        purchaseOrderId: reqPo.id,
+        receiptId: linkReceiptId,
+        requiresPhysicalReceipt: requiresReceiptForActive,
+        isPartialBilling: editIsPartialBilling,
+      },
+      reqPo,
+      {
+        savedEquivalences: productEquivalences,
+        otherLinkedInvoicesForPo: otherForReqPo,
+      }
+    );
+  }, [
+    activeInvoice,
+    activeAdjustmentRequest,
+    purchaseOrders,
+    fiscalInvoices,
+    editTotalProducts,
+    editDiscountAmount,
+    editOtherExpensesAmount,
+    editSurchargeAmount,
+    editComputedTotal,
+    editItemAssociations,
+    linkReceiptId,
+    requiresReceiptForActive,
+    editIsPartialBilling,
+    productEquivalences,
+  ]);
+
+  const activeConferenceFingerprint = useMemo(() => {
+    if (!activeInvoice || !modalMatchPreview) return '';
+    const po = purchaseOrders.find((p) => p.id === linkPoId);
+    const rec = physicalReceipts.find((r) => r.id === linkReceiptId);
+    const docType = activeInvoice.docType || 'NFE';
+    return buildConferenceFingerprint({
+      invoice: {
+        docType,
+        grossAmount: editTotalProducts,
+        totalProducts: editTotalProducts,
+        freightAmount: docType === 'NFSE' ? 0 : editFreightAmount,
+        insuranceAmount: docType === 'NFSE' ? 0 : editInsuranceAmount,
+        otherExpensesAmount: editOtherExpensesAmount,
+        surchargeAmount: editSurchargeAmount,
+        discountAmount: editDiscountAmount,
+        ipiAmount: docType === 'NFE' ? editIpiAmount : 0,
+        icmsStAmount: docType === 'NFE' ? editIcmsStAmount : 0,
+        pisAmount: editPisAmount,
+        cofinsAmount: editCofinsAmount,
+        csllAmount: editCsllAmount,
+        issqnAmount: editIssqnAmount,
+        issqnRetained: editIssqnRetained,
+        inssAmount: editInssAmount,
+        irrfAmount: editIrrfAmount,
+        retainedTaxesAmount: docType === 'NFSE' ? 0 : editRetainedTaxesAmount,
+        taxRegime: docType === 'NFSE' ? editTaxRegime : '',
+        totalInvoice: editComputedTotal,
+        items: activeInvoice.items,
+      },
+      po,
+      receipt: rec,
+      itemAssociations: modalMatchPreview.associations,
+      requiresPhysicalReceipt: requiresReceiptForActive,
+      isPartialBilling: editIsPartialBilling,
+    });
+  }, [
+    activeInvoice,
+    modalMatchPreview,
+    purchaseOrders,
+    physicalReceipts,
+    linkPoId,
+    linkReceiptId,
+    editTotalProducts,
+    editFreightAmount,
+    editInsuranceAmount,
+    editOtherExpensesAmount,
+    editSurchargeAmount,
+    editDiscountAmount,
+    editIpiAmount,
+    editIcmsStAmount,
+    editPisAmount,
+    editCofinsAmount,
+    editCsllAmount,
+    editIssqnAmount,
+    editIssqnRetained,
+    editInssAmount,
+    editIrrfAmount,
+    editRetainedTaxesAmount,
+    editTaxRegime,
+    editComputedTotal,
+    requiresReceiptForActive,
+    editIsPartialBilling,
+  ]);
+
+  const isConferenceStale = useMemo(() => {
+    if (!activeInvoice || activeInvoice.conferenceStatus !== 'conferido') return false;
+    if (!activeInvoice.conferenceDataVersion || !activeConferenceFingerprint) return false;
+    return activeInvoice.conferenceDataVersion !== activeConferenceFingerprint;
+  }, [activeInvoice, activeConferenceFingerprint]);
+
+  const handleConfirmActiveConference = async () => {
+    if (!activeInvoice || !modalMatchPreview || !canEditActiveInvoice) return;
+    setModalError(null);
+    setModalSuccess(null);
+
+    if (!linkPoId) {
+      setModalError('Vincule um Pedido de Compra antes de confirmar a conferência.');
+      return;
+    }
+    if (modalMatchPreview.unmatchedInvoiceItemIndexes.length > 0) {
+      setModalError(
+        'Concilie todos os itens da nota fiscal com o Pedido de Compra antes de confirmar a conferência.'
+      );
+      return;
+    }
+
+    const outcome: 'sem_divergencia' | 'divergente' =
+      modalMatchPreview.conferenceBadgeState === 'sem_divergencia'
+        ? 'sem_divergencia'
+        : 'divergente';
+
+    if (outcome === 'divergente' && !confJustificationInput.trim()) {
+      setModalError(
+        'Há divergências apontadas no cruzamento. Informe uma justificativa para confirmar a conferência.'
+      );
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await confirmInvoiceConference(activeInvoice.id, {
+        originalOutcome: outcome,
+        justification: confJustificationInput.trim(),
+        dataVersion: activeConferenceFingerprint,
+        itemAssociations: modalMatchPreview.associations,
+        matchingStatus: modalMatchPreview.status,
+      });
+      setActiveInvoice((prev) =>
+        prev
+          ? {
+              ...prev,
+              conferenceStatus: 'conferido',
+              conferenceOriginalOutcome: outcome,
+              conferenceJustification: confJustificationInput.trim(),
+              conferenceDataVersion: activeConferenceFingerprint,
+              itemAssociations: modalMatchPreview.associations,
+            }
+          : null
+      );
+      setModalSuccess('Conferência confirmada! A escrituração continua sob seu controle.');
+    } catch (err) {
+      setModalError(formatFiscalActionError(err, 'Não foi possível confirmar a conferência.'));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCreateActiveAdjustment = async () => {
+    if (!activeInvoice || !modalMatchPreview || !canEditActiveInvoice) return;
+    setModalError(null);
+    setModalSuccess(null);
+    const po = purchaseOrders.find((p) => p.id === linkPoId);
+    if (!po) {
+      setModalError('Selecione um Pedido de Compra para enviar a solicitação de ajuste.');
+      return;
+    }
+    if (activeAdjustmentRequest) {
+      setModalError('Já existe uma solicitação de ajuste em aberto para esta nota.');
+      return;
+    }
+
+    const divergentItemsSnapshot = modalMatchPreview.itemComparisons
+      .filter((cmp) => !cmp.matchedInPo || !cmp.qtyMatch || !cmp.unitPriceMatch)
+      .map((cmp) => ({
+        invoiceItemDescription: cmp.description,
+        ...(cmp.poDescription ? { poItemDescription: cmp.poDescription } : {}),
+        poQty: cmp.poQty,
+        invoiceQty: cmp.invoiceQty,
+        poUnitPrice: cmp.poUnitPrice,
+        invoiceUnitPrice: cmp.invoiceUnitPrice,
+        reason: !cmp.matchedInPo
+          ? 'Item não conciliado no Pedido'
+          : !cmp.qtyMatch
+          ? 'Quantidade divergente'
+          : 'Valor unitário divergente',
+      }));
+
+    setSaving(true);
+    try {
+      const reqId = await createAdjustmentRequest({
+        fiscalInvoiceId: activeInvoice.id,
+        invoiceNumber: activeInvoice.nfeNumber,
+        docType: activeInvoice.docType || 'NFE',
+        supplierName: activeInvoice.issuerName,
+        supplierCnpj: activeInvoice.issuerCnpj,
+        po,
+        divergenceReasons:
+          modalMatchPreview.reasons.length > 0
+            ? modalMatchPreview.reasons
+            : ['Divergência identificada pelo setor Fiscal'],
+        divergentItems: divergentItemsSnapshot,
+        poGrossTotal: modalMatchPreview.poGrossTotal ?? po.totalAmount,
+        poNetTotal: modalMatchPreview.poTotal ?? po.totalAmount,
+        invoiceGrossTotal: editTotalProducts,
+        invoiceNetTotal: editComputedTotal,
+        fiscalObservation: adjObservationInput.trim(),
+      });
+      setLinkPoId('');
+      setActiveInvoice((prev) =>
+        prev
+          ? {
+              ...prev,
+              purchaseOrderId: '',
+              poNumber: '',
+              pendingAdjustmentId: reqId,
+              pendingAdjustmentPoId: po.id,
+              pendingAdjustmentPoNumber: po.poNumber,
+              matchingStatus: 'pendente_vinculo',
+            }
+          : null
+      );
+      setModalSuccess(
+        `Solicitação enviada ao setor de Compras referente ao Pedido ${po.poNumber}. A nota foi mantida sem vínculo definitivo até o ajuste.`
+      );
+    } catch (err) {
+      setModalError(
+        formatFiscalActionError(err, 'Falha ao enviar solicitação de ajuste para Compras.')
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleResolveOrUpdateActiveAdjustment = async (
+    action: 'Resolvido' | 'Reaberto' | 'Cancelado'
+  ) => {
+    if (!activeInvoice || !activeAdjustmentRequest || !canEditActiveInvoice) return;
+    setModalError(null);
+    setModalSuccess(null);
+
+    if (action === 'Reaberto' && !fiscalResolutionNote.trim()) {
+      setModalError('Informe o motivo ao reabrir a solicitação para o setor de Compras.');
+      return;
+    }
+
+    setSaving(true);
+    try {
+      if (action === 'Resolvido') {
+        const targetPo = purchaseOrders.find((p) => p.id === activeAdjustmentRequest.purchaseOrderId);
+        if (!targetPo) {
+          throw new Error('Pedido de Compra da solicitação não encontrado.');
+        }
+        const linkMatch = adjustmentPreviewMatch;
+        await updateAdjustmentRequestAsFiscal(
+          activeAdjustmentRequest.id,
+          'Resolvido',
+          fiscalResolutionNote.trim() || 'Ajuste validado e Pedido vinculado pelo Fiscal.',
+          {
+            linkPo: {
+              purchaseOrderId: targetPo.id,
+              poNumber: targetPo.poNumber,
+              matchingStatus: linkMatch?.status || 'conciliada',
+              itemAssociations: linkMatch?.associations || editItemAssociations,
+            },
+          }
+        );
+        setLinkPoId(targetPo.id);
+        if (linkMatch?.associations) {
+          setEditItemAssociations(linkMatch.associations);
+        }
+        setActiveInvoice((prev) =>
+          prev
+            ? {
+                ...prev,
+                purchaseOrderId: targetPo.id,
+                poNumber: targetPo.poNumber,
+                pendingAdjustmentId: '',
+                pendingAdjustmentPoId: '',
+                pendingAdjustmentPoNumber: '',
+                matchingStatus: linkMatch?.status || 'conciliada',
+                itemAssociations: linkMatch?.associations || editItemAssociations,
+              }
+            : null
+        );
+        setModalSuccess(`Pedido ${targetPo.poNumber} vinculado e solicitação concluída.`);
+      } else if (action === 'Reaberto') {
+        const reqPo = purchaseOrders.find((p) => p.id === activeAdjustmentRequest.purchaseOrderId);
+        const linkMatch = adjustmentPreviewMatch;
+        const divergentItemsSnapshot = (linkMatch?.itemComparisons || [])
+          .filter((cmp) => !cmp.matchedInPo || !cmp.qtyMatch || !cmp.unitPriceMatch)
+          .map((cmp) => ({
+            invoiceItemDescription: cmp.description,
+            ...(cmp.poDescription ? { poItemDescription: cmp.poDescription } : {}),
+            poQty: cmp.poQty,
+            invoiceQty: cmp.invoiceQty,
+            poUnitPrice: cmp.poUnitPrice,
+            invoiceUnitPrice: cmp.invoiceUnitPrice,
+            reason: !cmp.matchedInPo
+              ? 'Item não conciliado no Pedido'
+              : !cmp.qtyMatch
+              ? 'Quantidade divergente'
+              : 'Valor unitário divergente',
+          }));
+        await updateAdjustmentRequestAsFiscal(
+          activeAdjustmentRequest.id,
+          'Reaberto',
+          fiscalResolutionNote.trim(),
+          {
+            divergenceReasons: linkMatch?.reasons || activeAdjustmentRequest.divergenceReasons,
+            divergentItems: divergentItemsSnapshot,
+            poGrossTotal: linkMatch?.poGrossTotal ?? reqPo?.totalAmount ?? activeAdjustmentRequest.poGrossTotal,
+            poNetTotal: linkMatch?.poTotal ?? reqPo?.totalAmount ?? activeAdjustmentRequest.poNetTotal,
+            invoiceGrossTotal: editTotalProducts,
+            invoiceNetTotal: editComputedTotal,
+          }
+        );
+        setFiscalResolutionNote('');
+        setModalSuccess('Solicitação reaberta para nova revisão do setor de Compras.');
+      } else {
+        await updateAdjustmentRequestAsFiscal(
+          activeAdjustmentRequest.id,
+          'Cancelado',
+          fiscalResolutionNote.trim() || 'Solicitação cancelada pelo setor Fiscal.'
+        );
+        setActiveInvoice((prev) =>
+          prev
+            ? {
+                ...prev,
+                pendingAdjustmentId: '',
+                pendingAdjustmentPoId: '',
+                pendingAdjustmentPoNumber: '',
+              }
+            : null
+        );
+        setFiscalResolutionNote('');
+        setModalSuccess('Solicitação de ajuste cancelada.');
+      }
+    } catch (err) {
+      setModalError(
+        formatFiscalActionError(err, 'Falha ao atualizar solicitação de ajuste.')
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const handleSaveReconciliation = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeInvoice || !modalMatchPreview || !canEditActiveInvoice) return;
     setModalError(null);
+    setModalSuccess(null);
 
     const po = purchaseOrders.find((p) => p.id === linkPoId);
     const rec = physicalReceipts.find((r) => r.id === linkReceiptId);
 
-    if ((editFiscalStatus === 'lancado' || editFiscalStatus === 'escriturada') && !rec) {
+    if (activeAdjustmentRequest && po) {
       setModalError(
-        'Liberação bloqueada: a nota fiscal só pode ser lançada após a sinalização do recebimento físico pelo setor de Recebimento.'
+        'Esta nota possui uma solicitação de ajuste aberta com Compras. Utilize "Resolver e Vincular Pedido" ou cancele a solicitação antes de vincular manualmente.'
+      );
+      return;
+    }
+
+    if (editFiscalStatus === 'lancado' || editFiscalStatus === 'escriturada') {
+      if (!po) {
+        setModalError(
+          'Liberação bloqueada: é obrigatório vincular um Pedido de Compra antes de lançar a nota fiscal.'
+        );
+        return;
+      }
+      if (requiresReceiptForActive && !rec) {
+        setModalError(
+          'Liberação bloqueada: esta nota exige confirmação de recebimento físico pelo setor de Recebimento antes do lançamento.'
+        );
+        return;
+      }
+    }
+
+    if (!requiresReceiptForActive && editFiscalStatus === 'aguardando_recebimento') {
+      setModalError(
+        'Notas que dispensam o recebimento físico não utilizam o status Aguardando Recebimento (utilize Pendente ou Lançado).'
       );
       return;
     }
@@ -1071,62 +1996,87 @@ export function FiscalModule() {
         ? fiscalInvoices.find((f) => f.id === editLinkedInvoiceId)
         : undefined;
 
+    const effectiveDocType = activeInvoice.docType || 'NFE';
+    const finalReceipt = requiresReceiptForActive ? rec : undefined;
+
     setSaving(true);
     try {
       await updateFiscalInvoice(activeInvoice.id, {
         purchaseOrderId: po?.id || '',
         poNumber: po?.poNumber || '',
-        receiptId: rec?.id || '',
-        receiptNumber: rec?.receiptNumber || '',
-        linkedInvoiceId: activeInvoice.docType === 'CTE' ? linkedInv?.id || '' : '',
-        linkedInvoiceNumber: activeInvoice.docType === 'CTE' ? linkedInv?.nfeNumber || '' : '',
-        originState: activeInvoice.docType === 'CTE' ? editOriginState : '',
-        originCity: activeInvoice.docType === 'CTE' ? editOriginCity : '',
-        destinationState: activeInvoice.docType === 'CTE' ? editDestinationState : '',
-        destinationCity: activeInvoice.docType === 'CTE' ? editDestinationCity : '',
+        receiptId: finalReceipt?.id || '',
+        receiptNumber: finalReceipt?.receiptNumber || '',
+        requiresPhysicalReceipt: requiresReceiptForActive,
+        isPartialBilling: Boolean(po && editIsPartialBilling),
+        itemAssociations: modalMatchPreview.associations,
+        linkedInvoiceId: effectiveDocType === 'CTE' ? linkedInv?.id || '' : '',
+        linkedInvoiceNumber: effectiveDocType === 'CTE' ? linkedInv?.nfeNumber || '' : '',
+        originState: effectiveDocType === 'CTE' ? editOriginState : '',
+        originCity: effectiveDocType === 'CTE' ? editOriginCity : '',
+        destinationState: effectiveDocType === 'CTE' ? editDestinationState : '',
+        destinationCity: effectiveDocType === 'CTE' ? editDestinationCity : '',
         issuerState:
-          (activeInvoice.docType || 'NFE') === 'NFE'
+          effectiveDocType === 'NFE'
             ? editIssuerState.trim().toUpperCase()
             : (activeInvoice.issuerState || '').trim().toUpperCase(),
-        suframaPinNumber:
-          (activeInvoice.docType || 'NFE') === 'NFE' ? editSuframaPinNumber.trim() : '',
+        suframaPinNumber: effectiveDocType === 'NFE' ? editSuframaPinNumber.trim() : '',
         suframaPinAcceptanceDate:
-          (activeInvoice.docType || 'NFE') === 'NFE' ? editSuframaPinAcceptanceDate : '',
+          effectiveDocType === 'NFE' ? editSuframaPinAcceptanceDate : '',
         suframaPinReceiptDate:
-          (activeInvoice.docType || 'NFE') === 'NFE' ? editSuframaPinReceiptDate : '',
-        suframaClearanceDate:
-          (activeInvoice.docType || 'NFE') === 'NFE' ? editSuframaClearanceDate : '',
-        taxRegime: activeInvoice.docType === 'NFSE' ? editTaxRegime : '',
+          effectiveDocType === 'NFE' ? editSuframaPinReceiptDate : '',
+        suframaClearanceDate: effectiveDocType === 'NFE' ? editSuframaClearanceDate : '',
+        grossAmount: Number(editTotalProducts || 0),
+        totalProducts: Number(editTotalProducts || 0),
+        freightAmount: effectiveDocType === 'NFSE' ? 0 : Number(editFreightAmount || 0),
+        insuranceAmount: effectiveDocType === 'NFSE' ? 0 : Number(editInsuranceAmount || 0),
+        otherExpensesAmount: Number(editOtherExpensesAmount || 0),
+        surchargeAmount: Number(editSurchargeAmount || 0),
+        discountAmount: Number(editDiscountAmount || 0),
+        icmsAmount: effectiveDocType === 'NFSE' ? 0 : Number(editIcmsAmount || 0),
+        icmsDesonAmount: effectiveDocType === 'NFSE' ? 0 : Number(editIcmsDesonAmount || 0),
+        icmsStAmount: effectiveDocType === 'NFE' ? Number(editIcmsStAmount || 0) : 0,
+        ipiAmount: effectiveDocType === 'NFE' ? Number(editIpiAmount || 0) : 0,
+        retainedTaxesAmount:
+          effectiveDocType === 'NFSE' ? 0 : Number(editRetainedTaxesAmount || 0),
+        taxRegime: effectiveDocType === 'NFSE' ? editTaxRegime : '',
         pisAmount:
-          activeInvoice.docType === 'NFSE'
+          effectiveDocType === 'NFSE'
             ? editTaxRegime === 'regime_normal'
               ? Number(editPisAmount || 0)
               : 0
-            : activeInvoice.pisAmount,
+            : Number(editPisAmount || 0),
         cofinsAmount:
-          activeInvoice.docType === 'NFSE'
+          effectiveDocType === 'NFSE'
             ? editTaxRegime === 'regime_normal'
               ? Number(editCofinsAmount || 0)
               : 0
-            : activeInvoice.cofinsAmount,
+            : Number(editCofinsAmount || 0),
+        csllAmount:
+          effectiveDocType === 'NFSE'
+            ? editTaxRegime === 'regime_normal'
+              ? Number(editCsllAmount || 0)
+              : 0
+            : Number(editCsllAmount || 0),
         issqnAmount:
-          activeInvoice.docType === 'NFSE'
+          effectiveDocType === 'NFSE'
             ? editTaxRegime === 'mei'
               ? 0
               : Number(editIssqnAmount || 0)
             : Number(activeInvoice.issqnAmount || 0),
+        issqnRetained: effectiveDocType === 'NFSE' ? editIssqnRetained : true,
         inssAmount:
-          activeInvoice.docType === 'NFSE'
+          effectiveDocType === 'NFSE'
             ? editTaxRegime === 'mei'
               ? 0
               : Number(editInssAmount || 0)
             : Number(activeInvoice.inssAmount || 0),
         irrfAmount:
-          activeInvoice.docType === 'NFSE'
+          effectiveDocType === 'NFSE'
             ? editTaxRegime === 'regime_normal'
               ? Number(editIrrfAmount || 0)
               : 0
             : Number(activeInvoice.irrfAmount || 0),
+        totalInvoice: editComputedTotal,
         matchingStatus: modalMatchPreview.status,
         fiscalStatus: editFiscalStatus,
         replacedByInvoiceId: editFiscalStatus === 'substituida' ? replacementInv?.id || '' : '',
@@ -1142,7 +2092,7 @@ export function FiscalModule() {
       setActiveInvoice(null);
     } catch (err) {
       setModalError(
-        err instanceof Error ? err.message : 'Erro ao atualizar escrituração da nota fiscal.'
+        formatFiscalActionError(err, 'Erro ao atualizar escrituração da nota fiscal.')
       );
     } finally {
       setSaving(false);
@@ -1171,9 +2121,7 @@ export function FiscalModule() {
       setBatchSuccess(`Documento fiscal ${deletedNumber} excluído definitivamente.`);
     } catch (err) {
       setDeleteError(
-        err instanceof Error
-          ? err.message
-          : 'Não foi possível excluir o documento fiscal.'
+        formatFiscalActionError(err, 'Não foi possível excluir o documento fiscal.')
       );
     } finally {
       setSaving(false);
@@ -1193,23 +2141,50 @@ export function FiscalModule() {
 
   const manualComputedTotal = useMemo(
     () =>
-      Number(
-        Math.max(
-          0,
-          manualItemsSubtotal +
-            (manualDocType === 'NFSE' ? 0 : Number(manualFreightAmount || 0)) +
-            (manualDocType === 'NFSE' ? 0 : Number(manualIpiAmount || 0)) -
-            Number(manualDiscountAmount || 0) -
-            (manualDocType === 'NFSE' ? 0 : Number(manualIcmsDesonAmount || 0))
-        ).toFixed(2)
-      ),
+      calculateFiscalNetTotal({
+        docType: manualDocType,
+        totalProducts: manualItemsSubtotal,
+        freightAmount: manualFreightAmount,
+        insuranceAmount: manualInsuranceAmount,
+        otherExpensesAmount: manualOtherExpensesAmount,
+        surchargeAmount: manualSurchargeAmount,
+        ipiAmount: manualIpiAmount,
+        icmsStAmount: manualIcmsStAmount,
+        discountAmount: manualDiscountAmount,
+        retainedTaxesAmount: manualRetainedTaxesAmount,
+        taxRegime: manualDocType === 'NFSE' ? manualTaxRegime : '',
+        pisAmount: manualPisAmount,
+        cofinsAmount: manualCofinsAmount,
+        csllAmount:
+          manualDocType === 'NFSE'
+            ? manualTaxRegime === 'regime_normal'
+              ? manualCsllAmount
+              : 0
+            : 0,
+        issqnAmount: manualIssqnAmount,
+        issqnRetained: manualIssqnRetained,
+        inssAmount: manualInssAmount,
+        irrfAmount: manualIrrfAmount,
+      }),
     [
       manualDocType,
       manualItemsSubtotal,
       manualFreightAmount,
+      manualInsuranceAmount,
+      manualOtherExpensesAmount,
+      manualSurchargeAmount,
       manualIpiAmount,
+      manualIcmsStAmount,
       manualDiscountAmount,
-      manualIcmsDesonAmount,
+      manualRetainedTaxesAmount,
+      manualTaxRegime,
+      manualPisAmount,
+      manualCofinsAmount,
+      manualCsllAmount,
+      manualIssqnAmount,
+      manualIssqnRetained,
+      manualInssAmount,
+      manualIrrfAmount,
     ]
   );
 
@@ -1234,17 +2209,88 @@ export function FiscalModule() {
       });
   }, [purchaseOrders, physicalReceipts, manualIssuerCnpj]);
 
+  const manualMatchPreview = useMemo(() => {
+    const po = purchaseOrders.find((p) => p.id === manualPoId);
+    if (!po) return null;
+    const formattedCnpj = isValidCnpj(manualIssuerCnpj)
+      ? maskCnpj(manualIssuerCnpj)
+      : po.supplierCnpj;
+    const sanitizedItems = manualItems.map((it, idx) => ({
+      code: it.code.trim() || `ITEM-${String(idx + 1).padStart(3, '0')}`,
+      description: it.description.trim() || 'Item',
+      ncm: it.ncm.trim(),
+      cfop: '0000',
+      unit: it.unit.trim() || 'UN',
+      qty: Number(it.qty || 0),
+      unitPrice: Number(it.unitPrice || 0),
+      totalPrice: Number((Number(it.qty || 0) * Number(it.unitPrice || 0)).toFixed(2)),
+    }));
+    const otherLinkedForPo = fiscalInvoices
+      .filter((f) => f.purchaseOrderId === po.id)
+      .map((f) => ({
+        id: f.id,
+        docType: f.docType,
+        grossAmount: f.grossAmount,
+        totalProducts: f.totalProducts,
+        totalInvoice: f.totalInvoice,
+        discountAmount: f.discountAmount,
+        otherExpensesAmount: f.otherExpensesAmount,
+        surchargeAmount: f.surchargeAmount,
+        items: f.items,
+        itemAssociations: f.itemAssociations,
+      }));
+    return evaluatePreImportMatch(
+      {
+        docType: manualDocType,
+        issuerCnpj: formattedCnpj,
+        grossAmount: manualItemsSubtotal,
+        totalProducts: manualItemsSubtotal,
+        discountAmount: manualDiscountAmount,
+        otherExpensesAmount: manualOtherExpensesAmount,
+        surchargeAmount: manualSurchargeAmount,
+        totalInvoice: manualComputedTotal,
+        items: sanitizedItems,
+        purchaseOrderId: po.id,
+        receiptId: '',
+        requiresPhysicalReceipt: manualRequiresPhysicalReceipt,
+        isPartialBilling: manualIsPartialBilling,
+      },
+      po,
+      {
+        savedEquivalences: productEquivalences,
+        otherLinkedInvoicesForPo: otherLinkedForPo,
+      }
+    );
+  }, [
+    purchaseOrders,
+    fiscalInvoices,
+    productEquivalences,
+    manualPoId,
+    manualDocType,
+    manualIssuerCnpj,
+    manualItems,
+    manualItemsSubtotal,
+    manualDiscountAmount,
+    manualOtherExpensesAmount,
+    manualSurchargeAmount,
+    manualComputedTotal,
+    manualRequiresPhysicalReceipt,
+    manualIsPartialBilling,
+  ]);
+
   const handleManualTaxRegimeChange = (nextRegime: ServiceTaxRegime) => {
     setManualTaxRegime(nextRegime);
     if (nextRegime === 'mei') {
       setManualPisAmount(0);
       setManualCofinsAmount(0);
+      setManualCsllAmount(0);
       setManualIssqnAmount(0);
       setManualInssAmount(0);
       setManualIrrfAmount(0);
     } else if (nextRegime === 'simples_nacional') {
       setManualPisAmount(0);
       setManualCofinsAmount(0);
+      setManualCsllAmount(0);
       setManualIrrfAmount(0);
     }
   };
@@ -1259,15 +2305,25 @@ export function FiscalModule() {
     setManualIssuerName('');
     setManualIssuerCnpj('');
     setManualPoId('');
-    setManualFiscalStatus('aguardando_recebimento');
+    setManualRequiresPhysicalReceipt(true);
+    setManualIsPartialBilling(false);
+    setManualNotifyCompras(false);
+    setManualAdjObservation('');
     setManualFreightAmount(0);
+    setManualInsuranceAmount(0);
+    setManualOtherExpensesAmount(0);
+    setManualSurchargeAmount(0);
     setManualDiscountAmount(0);
     setManualIcmsAmount(0);
     setManualIcmsDesonAmount(0);
+    setManualIcmsStAmount(0);
     setManualIpiAmount(0);
+    setManualRetainedTaxesAmount(0);
     setManualPisAmount(0);
     setManualCofinsAmount(0);
+    setManualCsllAmount(0);
     setManualIssqnAmount(0);
+    setManualIssqnRetained(true);
     setManualInssAmount(0);
     setManualIrrfAmount(0);
     setManualTaxRegime('simples_nacional');
@@ -1281,7 +2337,6 @@ export function FiscalModule() {
     setManualSuframaPinAcceptanceDate('');
     setManualSuframaPinReceiptDate('');
     setManualSuframaClearanceDate('');
-    setManualTotalOverride('');
     setManualComplementaryInfo('');
     setManualNotes('');
     setManualItems([
@@ -1302,6 +2357,11 @@ export function FiscalModule() {
 
   const handleManualSelectPo = (nextPoId: string) => {
     setManualPoId(nextPoId);
+    if (!nextPoId) {
+      setManualIsPartialBilling(false);
+      setManualNotifyCompras(false);
+      setManualAdjObservation('');
+    }
     const po = purchaseOrders.find((p) => p.id === nextPoId);
     if (po) {
       if (!manualIssuerName.trim()) {
@@ -1437,12 +2497,11 @@ export function FiscalModule() {
       }
     }
 
-    const parsedOverride =
-      manualTotalOverride.trim() !== '' ? Number(manualTotalOverride.replace(',', '.')) : NaN;
-    const finalTotalInvoice =
-      Number.isFinite(parsedOverride) && parsedOverride >= 0
-        ? Number(parsedOverride.toFixed(2))
-        : manualComputedTotal;
+    const finalTotalInvoice = manualComputedTotal;
+    const requiresPhysicalReceipt = manualRequiresPhysicalReceipt;
+    const initialFiscalStatus: 'aguardando_recebimento' | 'pendente' = requiresPhysicalReceipt
+      ? 'aguardando_recebimento'
+      : 'pendente';
 
     const formattedCnpj = maskCnpj(manualIssuerCnpj);
     const sanitizedItems: FiscalInvoiceItem[] = manualItems.map((it, idx) => ({
@@ -1456,18 +2515,44 @@ export function FiscalModule() {
       totalPrice: Number((Number(it.qty) * Number(it.unitPrice)).toFixed(2)),
     }));
 
-    const match = evaluateThreeWayMatch(
+    const otherLinkedForPo = po
+      ? fiscalInvoices
+          .filter((f) => f.purchaseOrderId === po.id)
+          .map((f) => ({
+            id: f.id,
+            docType: f.docType,
+            grossAmount: f.grossAmount,
+            totalProducts: f.totalProducts,
+            totalInvoice: f.totalInvoice,
+            discountAmount: f.discountAmount,
+            otherExpensesAmount: f.otherExpensesAmount,
+            surchargeAmount: f.surchargeAmount,
+            items: f.items,
+            itemAssociations: f.itemAssociations,
+          }))
+      : [];
+
+    const match = evaluatePreImportMatch(
       {
+        docType: manualDocType,
         issuerCnpj: formattedCnpj,
         grossAmount: manualItemsSubtotal,
         totalProducts: manualItemsSubtotal,
+        discountAmount: manualDiscountAmount,
+        otherExpensesAmount: manualOtherExpensesAmount,
+        surchargeAmount: manualSurchargeAmount,
         totalInvoice: finalTotalInvoice,
         items: sanitizedItems,
         purchaseOrderId: po?.id || '',
         receiptId: '',
+        requiresPhysicalReceipt,
+        isPartialBilling: Boolean(po && manualIsPartialBilling),
       },
       po,
-      undefined
+      {
+        savedEquivalences: productEquivalences,
+        otherLinkedInvoicesForPo: otherLinkedForPo,
+      }
     );
 
     const linkedInv =
@@ -1487,6 +2572,10 @@ export function FiscalModule() {
           ? Number(manualCofinsAmount || 0)
           : 0
         : Number(manualCofinsAmount || 0);
+    const effectiveCsll =
+      manualDocType === 'NFSE' && manualTaxRegime === 'regime_normal'
+        ? Number(manualCsllAmount || 0)
+        : 0;
     const effectiveIssqn =
       manualDocType === 'NFSE' && manualTaxRegime !== 'mei'
         ? Number(manualIssqnAmount || 0)
@@ -1500,60 +2589,110 @@ export function FiscalModule() {
         ? Number(manualIrrfAmount || 0)
         : 0;
 
+    const shouldSendAdjustment = Boolean(manualNotifyCompras && po);
+    const divergentItemsSnapshot = match.itemComparisons
+      .filter((cmp) => !cmp.matchedInPo || !cmp.qtyMatch || !cmp.unitPriceMatch)
+      .map((cmp) => ({
+        invoiceItemDescription: cmp.description,
+        ...(cmp.poDescription ? { poItemDescription: cmp.poDescription } : {}),
+        poQty: cmp.poQty,
+        invoiceQty: cmp.invoiceQty,
+        poUnitPrice: cmp.poUnitPrice,
+        invoiceUnitPrice: cmp.invoiceUnitPrice,
+        reason: !cmp.matchedInPo
+          ? 'Item não conciliado no Pedido'
+          : !cmp.qtyMatch
+          ? 'Quantidade divergente'
+          : 'Valor unitário divergente',
+      }));
+
     setSaving(true);
     try {
-      await createFiscalInvoice({
-        docType: manualDocType,
-        accessKey: finalAccessKey,
-        nfeNumber: manualNfeNumber.trim(),
-        series: manualDocType === 'NFSE' ? 'NFS' : manualSeries.trim() || '1',
-        issuerName: manualIssuerName.trim(),
-        issuerCnpj: formattedCnpj,
-        issueDate: manualIssueDate,
-        cfop: '0000',
-        grossAmount: manualItemsSubtotal,
-        freightAmount: manualDocType === 'NFSE' ? 0 : Number(manualFreightAmount || 0),
-        discountAmount: Number(manualDiscountAmount || 0),
-        totalProducts: manualItemsSubtotal,
-        icmsAmount: manualDocType === 'NFSE' ? 0 : Number(manualIcmsAmount || 0),
-        icmsDesonAmount: manualDocType === 'NFSE' ? 0 : Number(manualIcmsDesonAmount || 0),
-        ipiAmount: manualDocType === 'NFSE' ? 0 : Number(manualIpiAmount || 0),
-        pisAmount: effectivePis,
-        cofinsAmount: effectiveCofins,
-        issqnAmount: effectiveIssqn,
-        inssAmount: effectiveInss,
-        irrfAmount: effectiveIrrf,
-        taxRegime: manualDocType === 'NFSE' ? manualTaxRegime : '',
-        linkedInvoiceId: linkedInv?.id || '',
-        linkedInvoiceNumber: linkedInv?.nfeNumber || '',
-        originState: manualDocType === 'CTE' ? manualOriginState : '',
-        originCity: manualDocType === 'CTE' ? manualOriginCity : '',
-        destinationState: manualDocType === 'CTE' ? manualDestinationState : '',
-        destinationCity: manualDocType === 'CTE' ? manualDestinationCity : '',
-        issuerState: (
-          manualIssuerState ||
-          (manualDocType !== 'NFSE' ? getUfFromCodeOrAccessKey(finalAccessKey) : '')
-        )
-          .trim()
-          .toUpperCase(),
-        suframaPinNumber: manualDocType === 'NFE' ? manualSuframaPinNumber.trim() : '',
-        suframaPinAcceptanceDate:
-          manualDocType === 'NFE' ? manualSuframaPinAcceptanceDate : '',
-        suframaPinReceiptDate: manualDocType === 'NFE' ? manualSuframaPinReceiptDate : '',
-        suframaClearanceDate: manualDocType === 'NFE' ? manualSuframaClearanceDate : '',
-        totalInvoice: finalTotalInvoice,
-        complementaryInfo: manualComplementaryInfo.trim(),
-        items: sanitizedItems,
-        purchaseOrderId: po?.id || '',
-        poNumber: po?.poNumber || '',
-        receiptId: '',
-        receiptNumber: '',
-        matchingStatus: match.status,
-        fiscalStatus: manualFiscalStatus,
-        bookkeepingDate: '',
-        xmlImported: false,
-        notes: manualNotes.trim(),
-      });
+      await createFiscalInvoicesBatch([
+        {
+          invoiceData: {
+            docType: manualDocType,
+            accessKey: finalAccessKey,
+            nfeNumber: manualNfeNumber.trim(),
+            series: manualDocType === 'NFSE' ? '' : manualSeries.trim() || '1',
+            issuerName: manualIssuerName.trim(),
+            issuerCnpj: formattedCnpj,
+            issueDate: manualIssueDate,
+            cfop: '0000',
+            grossAmount: manualItemsSubtotal,
+            freightAmount: manualDocType === 'NFSE' ? 0 : Number(manualFreightAmount || 0),
+            insuranceAmount: manualDocType === 'NFSE' ? 0 : Number(manualInsuranceAmount || 0),
+            otherExpensesAmount: Number(manualOtherExpensesAmount || 0),
+            surchargeAmount: Number(manualSurchargeAmount || 0),
+            discountAmount: Number(manualDiscountAmount || 0),
+            totalProducts: manualItemsSubtotal,
+            icmsAmount: manualDocType === 'NFSE' ? 0 : Number(manualIcmsAmount || 0),
+            icmsDesonAmount: manualDocType === 'NFSE' ? 0 : Number(manualIcmsDesonAmount || 0),
+            icmsStAmount: manualDocType === 'NFE' ? Number(manualIcmsStAmount || 0) : 0,
+            ipiAmount: manualDocType === 'NFE' ? Number(manualIpiAmount || 0) : 0,
+            pisAmount: effectivePis,
+            cofinsAmount: effectiveCofins,
+            csllAmount: effectiveCsll,
+            issqnAmount: effectiveIssqn,
+            issqnRetained: manualDocType === 'NFSE' ? manualIssqnRetained : true,
+            inssAmount: effectiveInss,
+            irrfAmount: effectiveIrrf,
+            retainedTaxesAmount:
+              manualDocType === 'NFSE' ? 0 : Number(manualRetainedTaxesAmount || 0),
+            taxRegime: manualDocType === 'NFSE' ? manualTaxRegime : '',
+            linkedInvoiceId: linkedInv?.id || '',
+            linkedInvoiceNumber: linkedInv?.nfeNumber || '',
+            originState: manualDocType === 'CTE' ? manualOriginState : '',
+            originCity: manualDocType === 'CTE' ? manualOriginCity : '',
+            destinationState: manualDocType === 'CTE' ? manualDestinationState : '',
+            destinationCity: manualDocType === 'CTE' ? manualDestinationCity : '',
+            issuerState: (
+              manualIssuerState ||
+              (manualDocType !== 'NFSE' ? getUfFromCodeOrAccessKey(finalAccessKey) : '')
+            )
+              .trim()
+              .toUpperCase(),
+            suframaPinNumber: manualDocType === 'NFE' ? manualSuframaPinNumber.trim() : '',
+            suframaPinAcceptanceDate:
+              manualDocType === 'NFE' ? manualSuframaPinAcceptanceDate : '',
+            suframaPinReceiptDate: manualDocType === 'NFE' ? manualSuframaPinReceiptDate : '',
+            suframaClearanceDate: manualDocType === 'NFE' ? manualSuframaClearanceDate : '',
+            totalInvoice: finalTotalInvoice,
+            complementaryInfo: manualComplementaryInfo.trim(),
+            items: sanitizedItems,
+            itemAssociations: match.associations,
+            purchaseOrderId: shouldSendAdjustment ? '' : po?.id || '',
+            poNumber: shouldSendAdjustment ? '' : po?.poNumber || '',
+            receiptId: '',
+            receiptNumber: '',
+            matchingStatus: shouldSendAdjustment ? 'pendente_vinculo' : match.status,
+            fiscalStatus: initialFiscalStatus,
+            requiresPhysicalReceipt,
+            isPartialBilling: Boolean(po && manualIsPartialBilling),
+            conferenceStatus: 'pendente',
+            bookkeepingDate: '',
+            xmlImported: false,
+            notes: manualNotes.trim(),
+          },
+          ...(shouldSendAdjustment && po
+            ? {
+                adjustmentRequest: {
+                  po,
+                  divergenceReasons:
+                    match.reasons.length > 0
+                      ? match.reasons
+                      : ['Divergência sinalizada no cadastro manual'],
+                  divergentItems: divergentItemsSnapshot,
+                  poGrossTotal: match.poGrossTotal ?? po.totalAmount,
+                  poNetTotal: match.poTotal ?? po.totalAmount,
+                  invoiceGrossTotal: manualItemsSubtotal,
+                  invoiceNetTotal: finalTotalInvoice,
+                  fiscalObservation: manualAdjObservation.trim(),
+                },
+              }
+            : {}),
+        },
+      ]);
       setManualModalOpen(false);
       setSubTab('controle');
       setBatchSuccess(
@@ -1561,7 +2700,7 @@ export function FiscalModule() {
       );
     } catch (err) {
       setManualFormError(
-        err instanceof Error ? err.message : 'Falha ao cadastrar documento fiscal manualmente.'
+        formatFiscalActionError(err, 'Falha ao cadastrar documento fiscal manualmente.')
       );
     } finally {
       setSaving(false);
@@ -1624,6 +2763,25 @@ export function FiscalModule() {
                 </button>
               )}
             </div>
+
+            <button
+              type="button"
+              onClick={() => setEquivalencesModalOpen(true)}
+              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <Layers className="w-3.5 h-3.5" />
+              Equivalências
+            </button>
+
+            <button
+              type="button"
+              disabled={filteredInvoices.length === 0}
+              onClick={() => exportFiscalInvoicesToExcel(filteredInvoices, companyUf)}
+              className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-50 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              Exportar Excel (.xlsx)
+            </button>
 
             <button
               type="button"
@@ -1728,6 +2886,7 @@ export function FiscalModule() {
                     { id: 'aguardando_recebimento', label: 'Aguardando Recebimento' },
                     { id: 'pendente', label: 'Pendente' },
                     { id: 'lancado', label: 'Lançado' },
+                    { id: 'aguardando_ajuste', label: 'Aguard. Ajuste Compras' },
                     { id: 'substituida', label: 'Substituídas' },
                     { id: 'rejeitada', label: 'Rejeitadas' },
                   ] as const
@@ -1938,11 +3097,21 @@ export function FiscalModule() {
                             inv.linkedInvoiceNumber ||
                             (inv.originCity && inv.destinationCity) ? (
                               <div className="font-mono text-slate-800 space-y-0.5">
-                                {inv.purchaseOrderId || inv.receiptId ? (
+                                {inv.purchaseOrderId || inv.receiptId || inv.requiresPhysicalReceipt === false ? (
                                   <>
-                                    <div>{inv.poNumber || 'Sem Pedido'}</div>
+                                    <div className="flex items-center gap-1.5">
+                                      <span>{inv.poNumber || 'Sem Pedido'}</span>
+                                      {inv.isPartialBilling && (
+                                        <span className="font-sans text-[10px] font-semibold px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
+                                          Parcial
+                                        </span>
+                                      )}
+                                    </div>
                                     <div className="text-slate-500">
-                                      {inv.receiptNumber || 'Sem Recebimento'}
+                                      {inv.receiptNumber ||
+                                        (inv.requiresPhysicalReceipt === false
+                                          ? 'Dispensa doca'
+                                          : 'Sem Recebimento')}
                                     </div>
                                   </>
                                 ) : null}
@@ -1978,29 +3147,86 @@ export function FiscalModule() {
                             {formatBRL(inv.totalInvoice)}
                           </td>
                           <td className="py-3 px-4 whitespace-nowrap">
-                            {inv.fiscalStatus === 'aguardando_recebimento' && (
-                              <StatusTag label="Aguardando Recebimento" tone="neutral" />
-                            )}
-                            {(inv.fiscalStatus === 'pendente' ||
-                              inv.fiscalStatus === 'aguardando_escrituracao') && (
-                              <StatusTag label="Pendente" tone="info" />
-                            )}
-                            {(inv.fiscalStatus === 'lancado' ||
-                              inv.fiscalStatus === 'escriturada') && (
-                              <StatusTag label="Lançado" tone="success" />
-                            )}
-                            {inv.fiscalStatus === 'substituida' && (
-                              <div>
-                                <StatusTag label="Substituída" tone="warning" />
-                                {inv.replacedByInvoiceNumber && (
-                                  <div className="text-[11px] text-amber-800 font-mono mt-1">
-                                    Subst. por NF {inv.replacedByInvoiceNumber}
-                                  </div>
+                            <div className="space-y-1">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {inv.fiscalStatus === 'aguardando_recebimento' && (
+                                  <StatusTag label="Aguardando Recebimento" tone="neutral" />
+                                )}
+                                {(inv.fiscalStatus === 'pendente' ||
+                                  inv.fiscalStatus === 'aguardando_escrituracao') && (
+                                  <StatusTag label="Pendente" tone="info" />
+                                )}
+                                {(inv.fiscalStatus === 'lancado' ||
+                                  inv.fiscalStatus === 'escriturada') && (
+                                  <StatusTag label="Lançado" tone="success" />
+                                )}
+                                {inv.fiscalStatus === 'substituida' && (
+                                  <StatusTag label="Substituída" tone="warning" />
+                                )}
+                                {inv.fiscalStatus === 'rejeitada' && (
+                                  <StatusTag label="Rejeitada" tone="danger" />
                                 )}
                               </div>
-                            )}
-                            {inv.fiscalStatus === 'rejeitada' && (
-                              <StatusTag label="Rejeitada" tone="danger" />
+                              {(() => {
+                                const rowAdj = adjustmentRequests.find(
+                                  (r) =>
+                                    r.fiscalInvoiceId === inv.id &&
+                                    r.status !== 'Resolvido' &&
+                                    r.status !== 'Cancelado'
+                                );
+                                if (rowAdj) {
+                                  return (
+                                    <div className="flex items-center gap-1.5">
+                                      <StatusTag label="Aguardando ajuste de Compras" tone="warning" />
+                                      {(rowAdj.status === 'Ajustado' ||
+                                        rowAdj.status === 'Devolvido para revisão fiscal') && (
+                                        <span className="text-[10px] font-semibold text-blue-700">
+                                          · Resposta Compras
+                                        </span>
+                                      )}
+                                    </div>
+                                  );
+                                }
+                                if (inv.conferenceStatus === 'conferido') {
+                                  return (
+                                    <div>
+                                      <StatusTag label="Conferido" tone="success" />
+                                    </div>
+                                  );
+                                }
+                                if (!inv.purchaseOrderId) {
+                                  return (
+                                    <div>
+                                      <StatusTag label="Aguardando Vinculação" tone="neutral" />
+                                    </div>
+                                  );
+                                }
+                                return (
+                                  <div>
+                                    <StatusTag
+                                      label={
+                                        inv.matchingStatus === 'conciliada'
+                                          ? 'Sem divergência'
+                                          : inv.matchingStatus === 'divergente'
+                                          ? 'Divergente'
+                                          : 'Aguardando Conciliação'
+                                      }
+                                      tone={
+                                        inv.matchingStatus === 'conciliada'
+                                          ? 'success'
+                                          : inv.matchingStatus === 'divergente'
+                                          ? 'warning'
+                                          : 'info'
+                                      }
+                                    />
+                                  </div>
+                                );
+                              })()}
+                            </div>
+                            {inv.fiscalStatus === 'substituida' && inv.replacedByInvoiceNumber && (
+                              <div className="text-[11px] text-amber-800 font-mono mt-1">
+                                Subst. por NF {inv.replacedByInvoiceNumber}
+                              </div>
                             )}
                             {(inv.docType || 'NFE') === 'NFE' &&
                               (inv.suframaPinNumber || inv.suframaClearanceDate || outOfState) && (
@@ -2167,11 +3393,30 @@ export function FiscalModule() {
                     Documentos Extraídos ({batchQueue.length})
                   </h3>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    {validBatchItems.length} pronto(s) para importação · Status inicial: Aguardando Recebimento
+                    {validBatchItems.length} pronto(s) para importação · Valor líquido calculado automaticamente
                   </p>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="inline-flex items-center gap-1.5 text-xs">
+                    <span className="text-slate-600 font-medium">
+                      Passará pelo recebimento físico? (Todos):
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => applyBatchRequiresPhysicalReceiptAll(true)}
+                      className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md cursor-pointer"
+                    >
+                      Sim (Exige Doca)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => applyBatchRequiresPhysicalReceiptAll(false)}
+                      className="px-2.5 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md cursor-pointer"
+                    >
+                      Não (Dispensa Doca)
+                    </button>
+                  </div>
                   <button
                     type="button"
                     onClick={() => setBatchQueue([])}
@@ -2200,178 +3445,245 @@ export function FiscalModule() {
                       <th className="py-3 px-4">Arquivo / Tipo</th>
                       <th className="py-3 px-4">Número / Chave</th>
                       <th className="py-3 px-4">Emitente / CNPJ</th>
-                      <th className="py-3 px-4 text-right">Bruto / Frete</th>
-                      <th className="py-3 px-4">Vincular Pedido</th>
-                      <th className="py-3 px-4">Validação</th>
+                      <th className="py-3 px-4 text-right">Líquido Calc. / Bruto</th>
+                      <th className="py-3 px-4">Recebimento & Pedido</th>
+                      <th className="py-3 px-4">Validação / Conferência</th>
                       <th className="py-3 px-4 text-right">Ações</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-xs">
-                    {batchQueue.map((item) => (
-                      <tr key={item.id} className="hover:bg-slate-50/80">
-                        <td className="py-3 px-4 whitespace-nowrap">
-                          <div className="font-medium text-slate-900 max-w-[160px] truncate">
-                            {item.fileName}
-                          </div>
-                          {item.parsed && (
-                            <span className="font-mono text-[11px] font-semibold text-blue-700">
-                              {item.parsed.docType} · {item.parsed.items.length} item(ns)
-                            </span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 whitespace-nowrap font-mono tabular-nums">
-                          {item.parsed ? (
-                            <>
-                              <div className="font-semibold text-slate-900">
-                                Nº {item.parsed.nfeNumber} · {formatDateBR(item.parsed.issueDate)}
-                              </div>
-                              <div className="text-slate-500">
-                                {formatAccessKeyShort(item.parsed.accessKey)}
-                              </div>
-                            </>
-                          ) : (
-                            <span className="text-slate-400">—</span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4">
-                          {item.parsed ? (
-                            <>
-                              <div className="font-medium text-slate-900 max-w-[200px] truncate">
-                                {item.parsed.issuerName}
-                              </div>
-                              <div className="font-mono text-slate-500 tabular-nums">
-                                {item.parsed.issuerCnpj}
-                                {item.parsed.issuerState ? ` · UF ${item.parsed.issuerState}` : ''}
-                                {item.parsed.docType === 'NFE' &&
-                                  item.parsed.issuerState &&
-                                  item.parsed.issuerState !== companyUf && (
-                                    <span className="font-sans font-semibold text-amber-700">
-                                      {' '}
-                                      · Fora
-                                    </span>
-                                  )}
-                              </div>
-                            </>
-                          ) : (
-                            <span className="text-red-700">{item.error}</span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-right font-mono tabular-nums whitespace-nowrap">
-                          {item.parsed ? (
-                            <>
-                              <div className="font-semibold text-slate-900">
-                                {formatBRL(item.parsed.grossAmount)}
-                              </div>
-                              {item.parsed.docType === 'NFSE' && item.parsed.taxRegime ? (
-                                <div className="text-slate-500 font-sans text-[11px]">
-                                  {SERVICE_TAX_REGIME_LABELS[item.parsed.taxRegime]}
+                    {batchQueue.map((item) => {
+                      const batchMatch = preImportMatchMap.get(item.id);
+                      const hasXmlTotalDiff = Boolean(
+                        item.parsed &&
+                          item.parsed.xmlDeclaredTotal !== undefined &&
+                          Math.abs(item.parsed.xmlDeclaredTotal - item.parsed.totalInvoice) > 0.01
+                      );
+                      return (
+                        <tr key={item.id} className="hover:bg-slate-50/80">
+                          <td className="py-3 px-4 whitespace-nowrap">
+                            <div className="font-medium text-slate-900 max-w-[160px] truncate">
+                              {item.fileName}
+                            </div>
+                            {item.parsed && (
+                              <span className="font-mono text-[11px] font-semibold text-blue-700">
+                                {item.parsed.docType} · {item.parsed.items.length} item(ns)
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 whitespace-nowrap font-mono tabular-nums">
+                            {item.parsed ? (
+                              <>
+                                <div className="font-semibold text-slate-900">
+                                  Nº {item.parsed.nfeNumber} · {formatDateBR(item.parsed.issueDate)}
                                 </div>
-                              ) : item.parsed.docType === 'CTE' &&
-                                (item.parsed.originCity || item.parsed.destinationCity) ? (
-                                <div className="text-slate-500 font-sans text-[11px]">
-                                  {item.parsed.originCity}/{item.parsed.originState} →{' '}
-                                  {item.parsed.destinationCity}/{item.parsed.destinationState}
-                                </div>
-                              ) : (
                                 <div className="text-slate-500">
-                                  Frete: {formatBRL(item.parsed.freightAmount)}
+                                  {formatAccessKeyShort(item.parsed.accessKey)}
                                 </div>
-                              )}
-                            </>
-                          ) : (
-                            '—'
-                          )}
-                        </td>
-                        <td className="py-3 px-4">
-                          {item.parsed && !item.error && !item.duplicate ? (
-                            (() => {
-                              const eligibleOrders = getEligiblePurchaseOrdersForCnpj(
-                                item.parsed.issuerCnpj
-                              );
-                              return (
-                                <div className="space-y-1.5">
-                                  <select
-                                    value={item.purchaseOrderId}
-                                    onChange={(e) =>
-                                      updateBatchItemLink(
-                                        item.id,
-                                        'purchaseOrderId',
-                                        e.target.value
-                                      )
-                                    }
-                                    className="w-52 px-2 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
-                                  >
-                                    <option value="">
-                                      {eligibleOrders.length === 0
-                                        ? 'Nenhum pedido pendente (mesmo CNPJ)'
-                                        : 'Sem vínculo agora'}
-                                    </option>
-                                    {eligibleOrders.map(({ po, remainingQty }) => (
-                                      <option key={po.id} value={po.id}>
-                                        {po.poNumber} · Saldo {remainingQty} un
-                                      </option>
-                                    ))}
-                                  </select>
-                                  {item.parsed.docType === 'CTE' && (
+                              </>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-4">
+                            {item.parsed ? (
+                              <>
+                                <div className="font-medium text-slate-900 max-w-[200px] truncate">
+                                  {item.parsed.issuerName}
+                                </div>
+                                <div className="font-mono text-slate-500 tabular-nums">
+                                  {item.parsed.issuerCnpj}
+                                  {item.parsed.issuerState ? ` · UF ${item.parsed.issuerState}` : ''}
+                                  {item.parsed.docType === 'NFE' &&
+                                    item.parsed.issuerState &&
+                                    item.parsed.issuerState !== companyUf && (
+                                      <span className="font-sans font-semibold text-amber-700">
+                                        {' '}
+                                        · Fora
+                                      </span>
+                                    )}
+                                </div>
+                              </>
+                            ) : (
+                              <span className="text-red-700">{item.error}</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono tabular-nums whitespace-nowrap">
+                            {item.parsed ? (
+                              <>
+                                <div className="font-semibold text-slate-900">
+                                  {formatBRL(item.parsed.totalInvoice)}
+                                </div>
+                                {hasXmlTotalDiff && (
+                                  <div className="text-[11px] font-sans text-amber-700 font-medium">
+                                    XML declarava {formatBRL(item.parsed.xmlDeclaredTotal!)}
+                                  </div>
+                                )}
+                                {item.parsed.docType === 'NFSE' && item.parsed.taxRegime ? (
+                                  <div className="text-slate-500 font-sans text-[11px]">
+                                    Bruto: {formatBRL(item.parsed.grossAmount)} ·{' '}
+                                    {SERVICE_TAX_REGIME_LABELS[item.parsed.taxRegime]?.split(' ')[0]}
+                                  </div>
+                                ) : item.parsed.docType === 'CTE' &&
+                                  (item.parsed.originCity || item.parsed.destinationCity) ? (
+                                  <div className="text-slate-500 font-sans text-[11px]">
+                                    {item.parsed.originCity}/{item.parsed.originState} →{' '}
+                                    {item.parsed.destinationCity}/{item.parsed.destinationState}
+                                  </div>
+                                ) : (
+                                  <div className="text-slate-500 text-[11px]">
+                                    Bruto: {formatBRL(item.parsed.grossAmount)} · Frete:{' '}
+                                    {formatBRL(item.parsed.freightAmount)}
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                          <td className="py-3 px-4">
+                            {item.parsed && !item.error && !item.duplicate ? (
+                              (() => {
+                                const eligibleOrders = getEligiblePurchaseOrdersForCnpj(
+                                  item.parsed.issuerCnpj
+                                );
+                                return (
+                                  <div className="space-y-1.5 w-64">
+                                    <div>
+                                      <label className="block text-[11px] font-medium text-slate-600 mb-0.5">
+                                        Passará pelo recebimento físico?
+                                      </label>
+                                      <select
+                                        value={item.requiresPhysicalReceipt ? 'sim' : 'nao'}
+                                        onChange={(e) => {
+                                          const req = e.target.value === 'sim';
+                                          updateBatchItem(item.id, {
+                                            requiresPhysicalReceipt: req,
+                                            initialFiscalStatus: req
+                                              ? 'aguardando_recebimento'
+                                              : 'pendente',
+                                          });
+                                        }}
+                                        className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded-md bg-slate-50 font-medium text-slate-800"
+                                      >
+                                        <option value="sim">Sim (Exige recebimento físico)</option>
+                                        <option value="nao">
+                                          Não (Dispensa recebimento físico)
+                                        </option>
+                                      </select>
+                                    </div>
                                     <select
-                                      value={item.linkedInvoiceId}
+                                      value={item.purchaseOrderId}
                                       onChange={(e) =>
-                                        updateBatchItemLink(
-                                          item.id,
-                                          'linkedInvoiceId',
-                                          e.target.value
-                                        )
+                                        updateBatchItem(item.id, {
+                                          purchaseOrderId: e.target.value,
+                                          ...(e.target.value ? {} : { isPartialBilling: false }),
+                                        })
                                       }
-                                      className="w-52 px-2 py-1.5 text-xs border border-blue-300 rounded-md bg-blue-50/40"
+                                      className="w-full px-2 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
                                     >
-                                      <option value="">Vincular NF-e / NFS-e (opcional)</option>
-                                      {linkableInvoicesForCte.map((nf) => (
-                                        <option key={nf.id} value={nf.id}>
-                                          {DOC_TYPE_LABELS[nf.docType || 'NFE']} {nf.nfeNumber} ·{' '}
-                                          {nf.issuerName.slice(0, 18)}
+                                      <option value="">
+                                        {eligibleOrders.length === 0
+                                          ? 'Nenhum pedido pendente (mesmo CNPJ)'
+                                          : 'Vincular pedido (opcional agora)'}
+                                      </option>
+                                      {eligibleOrders.map(({ po, remainingQty }) => (
+                                        <option key={po.id} value={po.id}>
+                                          {po.poNumber} · Saldo {remainingQty} un
                                         </option>
                                       ))}
                                     </select>
-                                  )}
-                                </div>
-                              );
-                            })()
-                          ) : (
-                            <span className="text-slate-400">—</span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 whitespace-nowrap">
-                          {item.error || item.duplicate ? (
-                            <StatusTag
-                              label={item.duplicate ? 'Duplicada' : 'Erro XML'}
-                              tone={item.duplicate ? 'warning' : 'danger'}
-                            />
-                          ) : (
-                            <StatusTag label="Válido" tone="success" />
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-right whitespace-nowrap">
-                          <div className="inline-flex items-center gap-1">
-                            {item.parsed && (
+                                    {item.purchaseOrderId && (
+                                      <label className="flex items-start gap-1.5 text-[11px] text-slate-700 cursor-pointer pt-0.5">
+                                        <input
+                                          type="checkbox"
+                                          checked={item.isPartialBilling}
+                                          onChange={(e) =>
+                                            updateBatchItem(item.id, {
+                                              isPartialBilling: e.target.checked,
+                                            })
+                                          }
+                                          className="mt-0.5 rounded border-slate-300"
+                                        />
+                                        <span>Faturamento parcial (várias NFs no Pedido)</span>
+                                      </label>
+                                    )}
+                                    {item.parsed.docType === 'CTE' && (
+                                      <select
+                                        value={item.linkedInvoiceId}
+                                        onChange={(e) =>
+                                          updateBatchItem(item.id, {
+                                            linkedInvoiceId: e.target.value,
+                                          })
+                                        }
+                                        className="w-full px-2 py-1.5 text-xs border border-blue-300 rounded-md bg-blue-50/40"
+                                      >
+                                        <option value="">Vincular NF-e / NFS-e (opcional)</option>
+                                        {linkableInvoicesForCte.map((nf) => (
+                                          <option key={nf.id} value={nf.id}>
+                                            {DOC_TYPE_LABELS[nf.docType || 'NFE']} {nf.nfeNumber} ·{' '}
+                                            {nf.issuerName.slice(0, 18)}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    )}
+                                  </div>
+                                );
+                              })()
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 whitespace-nowrap">
+                            {item.error || item.duplicate ? (
+                              <StatusTag
+                                label={item.duplicate ? 'Duplicada' : 'Erro XML'}
+                                tone={item.duplicate ? 'warning' : 'danger'}
+                              />
+                            ) : (
+                              <div className="space-y-1">
+                                <StatusTag label="XML Válido" tone="success" />
+                                {item.purchaseOrderId && batchMatch && (
+                                  <div>
+                                    {item.notifyCompras ? (
+                                      <StatusTag label="Notificar Compras" tone="warning" />
+                                    ) : item.conferenceConfirmed ? (
+                                      <StatusTag label="Conferido" tone="success" />
+                                    ) : batchMatch.conferenceBadgeState === 'sem_divergencia' ? (
+                                      <StatusTag label="Sem divergência" tone="success" />
+                                    ) : batchMatch.conferenceBadgeState === 'aguardando_conciliacao' ? (
+                                      <StatusTag label="Conciliar Itens" tone="info" />
+                                    ) : (
+                                      <StatusTag label="Divergente" tone="warning" />
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-right whitespace-nowrap">
+                            <div className="inline-flex items-center gap-1">
+                              {item.parsed && (
+                                <button
+                                  type="button"
+                                  onClick={() => setPreviewBatchItemId(item.id)}
+                                  className="px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded cursor-pointer"
+                                >
+                                  Itens & Conciliação
+                                </button>
+                              )}
                               <button
                                 type="button"
-                                onClick={() => setPreviewBatchItem(item)}
-                                className="px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 rounded cursor-pointer"
+                                onClick={() => removeBatchItem(item.id)}
+                                className="p-1 text-slate-400 hover:text-red-700 rounded cursor-pointer"
                               >
-                                Itens
+                                <Trash2 className="w-3.5 h-3.5" />
                               </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => removeBatchItem(item.id)}
-                              className="p-1 text-slate-400 hover:text-red-700 rounded cursor-pointer"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -2380,196 +3692,488 @@ export function FiscalModule() {
         </div>
       )}
 
-      {/* Batch Item Details Preview Modal */}
-      {previewBatchItem && previewBatchItem.parsed && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden">
-            <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between">
-              <div>
-                <h3 className="font-display text-base font-semibold text-slate-900">
-                  {previewBatchItem.parsed.docType} Nº {previewBatchItem.parsed.nfeNumber} ·{' '}
-                  {previewBatchItem.parsed.issuerName}
-                </h3>
-                <p className="font-mono text-xs text-slate-500">
-                  Chave: {previewBatchItem.parsed.accessKey}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setPreviewBatchItem(null)}
-                className="p-1.5 text-slate-400 hover:text-slate-700 cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            <div className="p-6 overflow-y-auto space-y-4 text-xs">
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-3 bg-slate-50 border border-slate-200 rounded-lg tabular-nums">
+      {/* Batch Item Details & Pre-Import Reconciliation Modal */}
+      {previewBatchItem && previewBatchItem.parsed && (() => {
+        const parsed = previewBatchItem.parsed;
+        const previewPo = purchaseOrders.find((p) => p.id === previewBatchItem.purchaseOrderId);
+        const previewMatch = preImportMatchMap.get(previewBatchItem.id);
+        const hasXmlTotalDiff =
+          parsed.xmlDeclaredTotal !== undefined &&
+          Math.abs(parsed.xmlDeclaredTotal - parsed.totalInvoice) > 0.01;
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
+            <div className="bg-white border border-slate-200 rounded-xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden">
+              <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50/70">
                 <div>
-                  <span className="text-slate-500 block">Valor Bruto</span>
-                  <span className="font-mono font-semibold text-slate-900">
-                    {formatBRL(previewBatchItem.parsed.grossAmount)}
-                  </span>
+                  <h3 className="font-display text-base font-semibold text-slate-900">
+                    {parsed.docType} Nº {parsed.nfeNumber} · {parsed.issuerName}
+                  </h3>
+                  <p className="font-mono text-xs text-slate-500">
+                    Chave: {parsed.accessKey}
+                  </p>
                 </div>
-                {previewBatchItem.parsed.docType === 'NFSE' ? (
-                  <>
+                <button
+                  type="button"
+                  onClick={() => setPreviewBatchItemId(null)}
+                  className="p-1.5 text-slate-400 hover:text-slate-700 cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="p-6 overflow-y-auto space-y-4 text-xs">
+                {hasXmlTotalDiff && (
+                  <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-amber-900 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                    <span>
+                      Atenção: o valor líquido declarado no XML ({formatBRL(parsed.xmlDeclaredTotal!)}) difere do líquido calculado ({formatBRL(parsed.totalInvoice)}). Confira os tributos e despesas antes de importar.
+                    </span>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-3 bg-slate-50 border border-slate-200 rounded-lg tabular-nums">
+                  <div>
+                    <span className="text-slate-500 block">Valor Bruto</span>
+                    <span className="font-mono font-semibold text-slate-900">
+                      {formatBRL(parsed.grossAmount)}
+                    </span>
+                  </div>
+                  {parsed.docType === 'NFSE' ? (
                     <div className="col-span-2">
                       <span className="text-slate-500 block">Regime Tributário (XML)</span>
                       <span className="font-semibold text-slate-900">
                         {
                           SERVICE_TAX_REGIME_LABELS[
-                            previewBatchItem.parsed.taxRegime || 'simples_nacional'
+                            parsed.taxRegime || 'simples_nacional'
                           ]
                         }
                       </span>
                     </div>
-                  </>
-                ) : (
-                  <>
-                    <div>
-                      <span className="text-slate-500 block">Valor de Frete</span>
-                      <span className="font-mono font-semibold text-slate-900">
-                        {formatBRL(previewBatchItem.parsed.freightAmount)}
+                  ) : (
+                    <>
+                      <div>
+                        <span className="text-slate-500 block">Frete / Seguro / Outr. Desp.</span>
+                        <span className="font-mono font-semibold text-slate-900">
+                          {formatBRL(parsed.freightAmount)} · {formatBRL(parsed.insuranceAmount || 0)} ·{' '}
+                          {formatBRL(parsed.otherExpensesAmount || 0)}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block">IPI / ICMS ST / Descontos</span>
+                        <span className="font-mono font-semibold text-slate-900">
+                          {formatBRL(parsed.ipiAmount)} · {formatBRL(parsed.icmsStAmount || 0)} ·{' '}
+                          {formatBRL(parsed.discountAmount || 0)}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                  <div>
+                    <span className="text-slate-500 block">Valor Líquido Calculado</span>
+                    <span className="font-mono font-bold text-slate-900">
+                      {formatBRL(parsed.totalInvoice)}
+                    </span>
+                  </div>
+                  {parsed.issuerState && (
+                    <div className="col-span-2 sm:col-span-4 pt-2 border-t border-slate-200 flex items-center justify-between">
+                      <span className="text-slate-600">
+                        UF do Emitente:{' '}
+                        <span className="font-mono font-semibold text-slate-900">
+                          {parsed.issuerState}
+                        </span>
                       </span>
+                      {parsed.docType === 'NFE' && (
+                        <span
+                          className={`font-semibold ${
+                            parsed.issuerState !== companyUf
+                              ? 'text-amber-700'
+                              : 'text-emerald-700'
+                          }`}
+                        >
+                          {parsed.issuerState !== companyUf
+                            ? `Nota de Fora (${parsed.issuerState} → ${companyUf})`
+                            : `Operação Interna (${companyUf})`}
+                        </span>
+                      )}
                     </div>
-                    <div>
-                      <span className="text-slate-500 block">ICMS Desonerado</span>
-                      <span className="font-mono font-semibold text-slate-900">
-                        {formatBRL(previewBatchItem.parsed.icmsDesonAmount || 0)}
-                      </span>
-                    </div>
-                  </>
-                )}
-                <div>
-                  <span className="text-slate-500 block">Total Documento</span>
-                  <span className="font-mono font-semibold text-slate-900">
-                    {formatBRL(previewBatchItem.parsed.totalInvoice)}
-                  </span>
+                  )}
                 </div>
-                {previewBatchItem.parsed.issuerState && (
-                  <div className="col-span-2 sm:col-span-4 pt-2 border-t border-slate-200 flex items-center justify-between">
-                    <span className="text-slate-600">
-                      UF do Emitente:{' '}
+
+                {parsed.docType === 'NFSE' && (
+                  <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 p-3 bg-slate-50 border border-slate-200 rounded-lg tabular-nums">
+                    <div>
+                      <span className="text-slate-500 block">PIS</span>
                       <span className="font-mono font-semibold text-slate-900">
-                        {previewBatchItem.parsed.issuerState}
-                      </span>
-                    </span>
-                    {previewBatchItem.parsed.docType === 'NFE' && (
-                      <span
-                        className={`font-semibold ${
-                          previewBatchItem.parsed.issuerState !== companyUf
-                            ? 'text-amber-700'
-                            : 'text-emerald-700'
-                        }`}
-                      >
-                        {previewBatchItem.parsed.issuerState !== companyUf
-                          ? `Nota de Fora (${previewBatchItem.parsed.issuerState} → ${companyUf})`
-                          : `Operação Interna (${companyUf})`}
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {previewBatchItem.parsed.docType === 'NFSE' && (
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 p-3 bg-slate-50 border border-slate-200 rounded-lg tabular-nums">
-                  <div>
-                    <span className="text-slate-500 block">PIS</span>
-                    <span className="font-mono font-semibold text-slate-900">
-                      {formatBRL(previewBatchItem.parsed.pisAmount || 0)}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">COFINS</span>
-                    <span className="font-mono font-semibold text-slate-900">
-                      {formatBRL(previewBatchItem.parsed.cofinsAmount || 0)}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">ISSQN</span>
-                    <span className="font-mono font-semibold text-slate-900">
-                      {formatBRL(previewBatchItem.parsed.issqnAmount || 0)}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">INSS</span>
-                    <span className="font-mono font-semibold text-slate-900">
-                      {formatBRL(previewBatchItem.parsed.inssAmount || 0)}
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">IRRF</span>
-                    <span className="font-mono font-semibold text-slate-900">
-                      {formatBRL(previewBatchItem.parsed.irrfAmount || 0)}
-                    </span>
-                  </div>
-                </div>
-              )}
-
-              {previewBatchItem.parsed.docType === 'CTE' &&
-                (previewBatchItem.parsed.originCity || previewBatchItem.parsed.destinationCity) && (
-                  <div className="grid grid-cols-2 gap-3 p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                    <div>
-                      <span className="text-slate-500 block">Origem</span>
-                      <span className="font-medium text-slate-900">
-                        {previewBatchItem.parsed.originCity || '—'} /{' '}
-                        {previewBatchItem.parsed.originState || '—'}
+                        {formatBRL(parsed.pisAmount || 0)}
                       </span>
                     </div>
                     <div>
-                      <span className="text-slate-500 block">Saída / Destino</span>
-                      <span className="font-medium text-slate-900">
-                        {previewBatchItem.parsed.destinationCity || '—'} /{' '}
-                        {previewBatchItem.parsed.destinationState || '—'}
+                      <span className="text-slate-500 block">COFINS</span>
+                      <span className="font-mono font-semibold text-slate-900">
+                        {formatBRL(parsed.cofinsAmount || 0)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">CSLL</span>
+                      <span className="font-mono font-semibold text-slate-900">
+                        {formatBRL(parsed.csllAmount || 0)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">
+                        ISSQN ({parsed.issqnRetained === false ? 'Destacado' : 'Retido'})
+                      </span>
+                      <span className="font-mono font-semibold text-slate-900">
+                        {formatBRL(parsed.issqnAmount || 0)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">INSS</span>
+                      <span className="font-mono font-semibold text-slate-900">
+                        {formatBRL(parsed.inssAmount || 0)}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">IRRF</span>
+                      <span className="font-mono font-semibold text-slate-900">
+                        {formatBRL(parsed.irrfAmount || 0)}
                       </span>
                     </div>
                   </div>
                 )}
 
-              <div className="border border-slate-200 rounded-lg overflow-hidden">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-200 text-slate-500">
-                      <th className="py-2 px-3">Código</th>
-                      <th className="py-2 px-3">Descrição</th>
-                      <th className="py-2 px-3 text-right">Qtd</th>
-                      <th className="py-2 px-3 text-right">Unitário</th>
-                      <th className="py-2 px-3 text-right">Total</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {previewBatchItem.parsed.items.map((it, idx) => (
-                      <tr key={idx}>
-                        <td className="py-2 px-3 font-mono">{it.code}</td>
-                        <td className="py-2 px-3">{it.description}</td>
-                        <td className="py-2 px-3 text-right font-mono tabular-nums">
-                          {it.qty} {it.unit}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono tabular-nums">
-                          {formatBRL(it.unitPrice)}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono font-medium tabular-nums">
-                          {formatBRL(it.totalPrice)}
-                        </td>
+                {parsed.docType === 'CTE' &&
+                  (parsed.originCity || parsed.destinationCity) && (
+                    <div className="grid grid-cols-2 gap-3 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                      <div>
+                        <span className="text-slate-500 block">Origem</span>
+                        <span className="font-medium text-slate-900">
+                          {parsed.originCity || '—'} / {parsed.originState || '—'}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block">Saída / Destino</span>
+                        <span className="font-medium text-slate-900">
+                          {parsed.destinationCity || '—'} / {parsed.destinationState || '—'}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                <div className="border border-slate-200 rounded-lg overflow-hidden">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                        <th className="py-2 px-3">Código</th>
+                        <th className="py-2 px-3">Descrição</th>
+                        <th className="py-2 px-3 text-right">Qtd</th>
+                        <th className="py-2 px-3 text-right">Unitário</th>
+                        <th className="py-2 px-3 text-right">Total</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {previewBatchItem.parsed.complementaryInfo && (
-                <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
-                  <span className="text-[11px] font-semibold text-slate-600 block mb-1">
-                    Informações Complementares (XML)
-                  </span>
-                  <p className="text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">
-                    {previewBatchItem.parsed.complementaryInfo}
-                  </p>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {parsed.items.map((it, idx) => (
+                        <tr key={idx}>
+                          <td className="py-2 px-3 font-mono">{it.code}</td>
+                          <td className="py-2 px-3">{it.description}</td>
+                          <td className="py-2 px-3 text-right font-mono tabular-nums">
+                            {it.qty} {it.unit}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono tabular-nums">
+                            {formatBRL(it.unitPrice)}
+                          </td>
+                          <td className="py-2 px-3 text-right font-mono font-medium tabular-nums">
+                            {formatBRL(it.totalPrice)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
-              )}
+
+                {/* Pre-Import Reconciliation with Selected PO */}
+                {previewPo && previewMatch && (
+                  <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="text-xs font-semibold text-slate-900 block">
+                          Conferência Pré-Importação × Pedido {previewPo.poNumber}
+                        </span>
+                        <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-700 mt-1 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={previewBatchItem.isPartialBilling}
+                            onChange={(e) =>
+                              updateBatchItem(previewBatchItem.id, {
+                                isPartialBilling: e.target.checked,
+                              })
+                            }
+                            className="rounded border-slate-300"
+                          />
+                          Faturamento / Entrega Parcial (múltiplas notas atendendo este Pedido)
+                        </label>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {previewBatchItem.conferenceConfirmed && (
+                          <StatusTag label="Conferido" tone="success" />
+                        )}
+                        <StatusTag
+                          label={
+                            previewMatch.conferenceBadgeState === 'sem_divergencia'
+                              ? 'Sem divergência'
+                              : previewMatch.conferenceBadgeState === 'aguardando_conciliacao'
+                              ? 'Aguardando Conciliação'
+                              : 'Divergente'
+                          }
+                          tone={
+                            previewMatch.conferenceBadgeState === 'sem_divergencia'
+                              ? 'success'
+                              : previewMatch.conferenceBadgeState === 'aguardando_conciliacao'
+                              ? 'info'
+                              : 'warning'
+                          }
+                        />
+                      </div>
+                    </div>
+
+                    <ItemReconciliationEditor
+                      supplierCnpj={parsed.issuerCnpj}
+                      invoiceItems={parsed.items}
+                      poItems={previewPo.items}
+                      associations={previewMatch.associations}
+                      suggestions={previewMatch.suggestions}
+                      unmatchedInvoiceItemIndexes={previewMatch.unmatchedInvoiceItemIndexes}
+                      unmatchedPoItemIndexes={previewMatch.unmatchedPoItemIndexes}
+                      canEdit={!previewBatchItem.notifyCompras}
+                      onChangeAssociations={(next) =>
+                        updateBatchItem(previewBatchItem.id, { itemAssociations: next })
+                      }
+                      onSaveEquivalence={(eq) => {
+                        const existing = previewBatchItem.pendingEquivalences || [];
+                        updateBatchItem(previewBatchItem.id, {
+                          pendingEquivalences: [...existing, eq],
+                        });
+                      }}
+                      saveEquivalenceLabel="Salvar equivalência ao importar"
+                    />
+
+                    {previewMatch.itemComparisons.length > 0 && (
+                      <div className="border border-slate-200 rounded-md bg-white overflow-hidden">
+                        <table className="w-full text-left border-collapse text-[11px]">
+                          <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                            <tr>
+                              <th className="py-1.5 px-2.5 font-medium">Item (Pedido × Nota)</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Qtd Ped.</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Qtd NF</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Unit. Ped.</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Unit. NF</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Conferência</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 tabular-nums">
+                            {previewMatch.itemComparisons.map((cmp, i) => (
+                              <tr key={i}>
+                                <td className="py-1.5 px-2.5 text-slate-800 max-w-[200px] truncate">
+                                  {cmp.description}
+                                </td>
+                                <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
+                                  {cmp.poQty !== null ? cmp.poQty : '—'}
+                                </td>
+                                <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
+                                  {cmp.invoiceQty !== null ? cmp.invoiceQty : '—'}
+                                </td>
+                                <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
+                                  {cmp.poUnitPrice !== null ? formatBRL(cmp.poUnitPrice) : '—'}
+                                </td>
+                                <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
+                                  {cmp.invoiceUnitPrice !== null
+                                    ? formatBRL(cmp.invoiceUnitPrice)
+                                    : '—'}
+                                </td>
+                                <td className="py-1.5 px-2.5 text-right whitespace-nowrap">
+                                  {!cmp.matchedInPo ? (
+                                    <span className="text-amber-700 font-medium">Fora do PO</span>
+                                  ) : !cmp.qtyMatch ? (
+                                    <span className="text-amber-700 font-medium">Qtd diverge</span>
+                                  ) : !cmp.unitPriceMatch ? (
+                                    <span className="text-slate-600">Unit. difere</span>
+                                  ) : (
+                                    <span className="text-emerald-700 font-medium">Confere</span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {previewMatch.financialComparison && (
+                      <div className="border border-slate-200 rounded-md bg-white overflow-hidden">
+                        <table className="w-full text-left border-collapse text-[11px]">
+                          <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                            <tr>
+                              <th className="py-1.5 px-2.5 font-medium">Confronto de Valores</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">
+                                Pedido de Compra
+                              </th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Nota Fiscal</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Situação</th>
+                            </tr>
+                          </thead>
+                          <tbody className="tabular-nums">
+                            <tr>
+                              <td className="py-2 px-2.5 font-medium text-slate-800">
+                                {previewMatch.financialComparison.criterionLabel}
+                                {previewMatch.isPartialBilling && (
+                                  <span className="text-blue-700 ml-1.5">(Parcela)</span>
+                                )}
+                              </td>
+                              <td className="py-2 px-2.5 text-right font-mono text-slate-900">
+                                {formatBRL(previewMatch.financialComparison.poComparedAmount)}
+                              </td>
+                              <td className="py-2 px-2.5 text-right font-mono text-slate-900">
+                                {formatBRL(previewMatch.financialComparison.invoiceComparedAmount)}
+                              </td>
+                              <td className="py-2 px-2.5 text-right whitespace-nowrap">
+                                {previewMatch.financialComparison.matches ? (
+                                  <span className="text-emerald-700 font-semibold">Confere</span>
+                                ) : (
+                                  <span className="text-amber-700 font-semibold">
+                                    Diverge ({formatBRL(previewMatch.financialComparison.differenceAmount)})
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {previewMatch.reasons.length > 0 && (
+                      <ul className="list-disc pl-4 text-xs text-amber-800 space-y-0.5">
+                        {previewMatch.reasons.map((r, i) => (
+                          <li key={i}>{r}</li>
+                        ))}
+                      </ul>
+                    )}
+
+                    <div className="pt-2 border-t border-slate-200 space-y-2.5">
+                      {previewMatch.conferenceBadgeState === 'divergente' &&
+                        !previewBatchItem.notifyCompras && (
+                          <div>
+                            <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                              Justificativa da conferência (obrigatória p/ confirmar divergência)
+                            </label>
+                            <input
+                              type="text"
+                              value={previewBatchItem.conferenceJustification || ''}
+                              onChange={(e) =>
+                                updateBatchItem(previewBatchItem.id, {
+                                  conferenceJustification: e.target.value,
+                                })
+                              }
+                              placeholder="Descreva o motivo de aceitar a divergência..."
+                              className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded bg-white"
+                            />
+                          </div>
+                        )}
+
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        {previewMatch.unmatchedInvoiceItemIndexes.length === 0 &&
+                          !previewBatchItem.notifyCompras && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (
+                                  previewMatch.conferenceBadgeState === 'divergente' &&
+                                  !(previewBatchItem.conferenceJustification || '').trim()
+                                ) {
+                                  return;
+                                }
+                                updateBatchItem(previewBatchItem.id, {
+                                  conferenceConfirmed: !previewBatchItem.conferenceConfirmed,
+                                });
+                              }}
+                              disabled={
+                                previewMatch.conferenceBadgeState === 'divergente' &&
+                                !(previewBatchItem.conferenceJustification || '').trim() &&
+                                !previewBatchItem.conferenceConfirmed
+                              }
+                              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg cursor-pointer disabled:opacity-50 ${
+                                previewBatchItem.conferenceConfirmed
+                                  ? 'text-emerald-800 bg-emerald-100 border border-emerald-300'
+                                  : 'text-white bg-slate-900 hover:bg-slate-800'
+                              }`}
+                            >
+                              <BookmarkCheck className="w-3.5 h-3.5" />
+                              {previewBatchItem.conferenceConfirmed
+                                ? 'Conferência Confirmada (Clique p/ desfazer)'
+                                : 'Confirmar Conferência na Importação'}
+                            </button>
+                          )}
+
+                        <label className="inline-flex items-center gap-2 text-xs font-medium text-amber-900 bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-lg cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={Boolean(previewBatchItem.notifyCompras)}
+                            onChange={(e) =>
+                              updateBatchItem(previewBatchItem.id, {
+                                notifyCompras: e.target.checked,
+                                conferenceConfirmed: false,
+                              })
+                            }
+                            className="rounded border-amber-400"
+                          />
+                          <MessageSquareWarning className="w-3.5 h-3.5 text-amber-700" />
+                          Notificar Compras e importar nota sem vínculo definitivo
+                        </label>
+                      </div>
+
+                      {previewBatchItem.notifyCompras && (
+                        <div>
+                          <label className="block text-[11px] font-medium text-amber-900 mb-1">
+                            Observação para o setor de Compras
+                          </label>
+                          <input
+                            type="text"
+                            value={previewBatchItem.adjustmentObservation || ''}
+                            onChange={(e) =>
+                              updateBatchItem(previewBatchItem.id, {
+                                adjustmentObservation: e.target.value,
+                              })
+                            }
+                            placeholder="Explique o ajuste necessário no Pedido de Compra..."
+                            className="w-full px-2.5 py-1.5 text-xs border border-amber-300 rounded bg-white"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {parsed.complementaryInfo && (
+                  <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                    <span className="text-[11px] font-semibold text-slate-600 block mb-1">
+                      Informações Complementares (XML)
+                    </span>
+                    <p className="text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">
+                      {parsed.complementaryInfo}
+                    </p>
+                  </div>
+                )}
+              </div>
+              <div className="px-6 py-3 border-t border-slate-200 bg-slate-50 flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setPreviewBatchItemId(null)}
+                  className="px-4 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 cursor-pointer"
+                >
+                  Concluir Revisão
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Ficha do Documento Fiscal & Conciliação Modal */}
       {activeInvoice && modalMatchPreview && (
@@ -2600,6 +4204,44 @@ export function FiscalModule() {
                   {activeInvoice.fiscalStatus === 'rejeitada' && (
                     <StatusTag label="Rejeitada" tone="danger" />
                   )}
+                  <StatusTag
+                    label={
+                      requiresReceiptForActive
+                        ? 'Exige Recebimento Físico'
+                        : 'Fluxo Direto (Sem Recebimento)'
+                    }
+                    tone={requiresReceiptForActive ? 'neutral' : 'info'}
+                  />
+                  {editIsPartialBilling && (
+                    <StatusTag label="Faturamento Parcial" tone="info" />
+                  )}
+                  {activeInvoice.conferenceStatus === 'conferido' && !isConferenceStale && (
+                    <StatusTag label="Conferido" tone="success" />
+                  )}
+                  <StatusTag
+                    label={
+                      activeAdjustmentRequest
+                        ? 'Aguardando ajuste de Compras'
+                        : modalMatchPreview.conferenceBadgeState === 'sem_divergencia'
+                        ? 'Sem divergência'
+                        : modalMatchPreview.conferenceBadgeState === 'divergente'
+                        ? 'Divergente'
+                        : modalMatchPreview.conferenceBadgeState === 'aguardando_conciliacao'
+                        ? 'Aguardando Conciliação'
+                        : 'Aguardando Vinculação'
+                    }
+                    tone={
+                      activeAdjustmentRequest
+                        ? 'warning'
+                        : modalMatchPreview.conferenceBadgeState === 'sem_divergencia'
+                        ? 'success'
+                        : modalMatchPreview.conferenceBadgeState === 'divergente'
+                        ? 'warning'
+                        : modalMatchPreview.conferenceBadgeState === 'aguardando_conciliacao'
+                        ? 'info'
+                        : 'neutral'
+                    }
+                  />
                 </div>
                 <p className="text-xs text-slate-600 mt-1">
                   <span className="font-medium text-slate-900">{activeInvoice.issuerName}</span> ·{' '}
@@ -2641,6 +4283,20 @@ export function FiscalModule() {
                   {modalError}
                 </div>
               )}
+              {modalSuccess && (
+                <div className="p-3.5 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800">
+                  {modalSuccess}
+                </div>
+              )}
+              {activeInvoice.xmlDeclaredTotal !== undefined &&
+                Math.abs(activeInvoice.xmlDeclaredTotal - editComputedTotal) > 0.01 && (
+                  <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+                    <span>
+                      Atenção: o total declarado no XML ({formatBRL(activeInvoice.xmlDeclaredTotal)}) difere do líquido recalculado ({formatBRL(editComputedTotal)}). Revise tributos, despesas acessórias e descontos.
+                    </span>
+                  </div>
+                )}
 
               {/* Chave de Acesso */}
               <div className="px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-lg flex flex-wrap items-center justify-between gap-2">
@@ -2662,45 +4318,139 @@ export function FiscalModule() {
 
               {/* 1. Resumo Financeiro e Tributos */}
               <div className="space-y-3">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                  1. Valores e Tributos do Documento
-                </h3>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                    1. Valores e Tributos do Documento
+                  </h3>
+                  <span className="text-[11px] text-slate-500">
+                    Valor Líquido calculado automaticamente (somente leitura)
+                  </span>
+                </div>
                 <div
                   className={`grid grid-cols-2 ${
-                    activeInvoice.docType === 'NFSE' ? 'sm:grid-cols-3' : 'sm:grid-cols-4'
+                    activeInvoice.docType === 'NFSE'
+                      ? 'sm:grid-cols-3 lg:grid-cols-5'
+                      : 'sm:grid-cols-4'
                   } gap-3 tabular-nums`}
                 >
                   <div className="p-3 rounded-lg border border-slate-200 bg-white">
-                    <span className="text-[11px] text-slate-500 block">
+                    <label className="text-[11px] text-slate-500 block mb-1">
                       {activeInvoice.docType === 'NFSE'
-                        ? 'Valor Bruto / Serviços'
-                        : 'Valor Bruto / Produtos'}
-                    </span>
-                    <span className="font-mono text-sm font-semibold text-slate-900 mt-0.5 block">
-                      {formatBRL(Number(activeInvoice.grossAmount ?? activeInvoice.totalProducts))}
-                    </span>
+                        ? 'Valor Bruto / Serviços (R$)'
+                        : 'Valor Bruto / Produtos (R$)'}
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      disabled={!canEditActiveInvoice}
+                      value={editTotalProducts}
+                      onChange={(e) =>
+                        setEditTotalProducts(Math.max(0, Number(e.target.value)))
+                      }
+                      className="w-full px-2.5 py-1.5 text-sm font-mono font-semibold text-slate-900 border border-slate-300 rounded-md bg-white disabled:bg-slate-50 disabled:border-slate-200"
+                    />
                   </div>
                   {activeInvoice.docType !== 'NFSE' && (
-                    <div className="p-3 rounded-lg border border-slate-200 bg-white">
-                      <span className="text-[11px] text-slate-500 block">Valor do Frete</span>
-                      <span className="font-mono text-sm font-semibold text-slate-900 mt-0.5 block">
-                        {formatBRL(Number(activeInvoice.freightAmount || 0))}
-                      </span>
-                    </div>
+                    <>
+                      <div className="p-3 rounded-lg border border-slate-200 bg-white">
+                        <label className="text-[11px] text-slate-500 block mb-1">
+                          Valor do Frete (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={!canEditActiveInvoice}
+                          value={editFreightAmount}
+                          onChange={(e) =>
+                            setEditFreightAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono font-semibold text-slate-900 border border-slate-300 rounded-md bg-white disabled:bg-slate-50 disabled:border-slate-200"
+                        />
+                      </div>
+                      <div className="p-3 rounded-lg border border-slate-200 bg-white">
+                        <label className="text-[11px] text-slate-500 block mb-1">
+                          Seguro (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={!canEditActiveInvoice}
+                          value={editInsuranceAmount}
+                          onChange={(e) =>
+                            setEditInsuranceAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono font-semibold text-slate-900 border border-slate-300 rounded-md bg-white disabled:bg-slate-50 disabled:border-slate-200"
+                        />
+                      </div>
+                    </>
                   )}
                   <div className="p-3 rounded-lg border border-slate-200 bg-white">
-                    <span className="text-[11px] text-slate-500 block">Descontos</span>
-                    <span className="font-mono text-sm font-semibold text-slate-900 mt-0.5 block">
-                      {formatBRL(Number(activeInvoice.discountAmount || 0))}
-                    </span>
+                    <label className="text-[11px] text-slate-500 block mb-1">
+                      Outras Despesas (R$)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      disabled={!canEditActiveInvoice}
+                      value={editOtherExpensesAmount}
+                      onChange={(e) =>
+                        setEditOtherExpensesAmount(Math.max(0, Number(e.target.value)))
+                      }
+                      className="w-full px-2.5 py-1.5 text-sm font-mono font-semibold text-slate-900 border border-slate-300 rounded-md bg-white disabled:bg-slate-50 disabled:border-slate-200"
+                    />
                   </div>
-                  <div className="p-3 rounded-lg border border-slate-300 bg-slate-50">
-                    <span className="text-[11px] text-slate-600 font-medium block">
-                      Total da Nota Fiscal
-                    </span>
-                    <span className="font-mono text-sm font-bold text-slate-900 mt-0.5 block">
-                      {formatBRL(activeInvoice.totalInvoice)}
-                    </span>
+                  <div className="p-3 rounded-lg border border-slate-200 bg-white">
+                    <label className="text-[11px] text-slate-500 block mb-1">
+                      Acréscimos (R$)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      disabled={!canEditActiveInvoice}
+                      value={editSurchargeAmount}
+                      onChange={(e) =>
+                        setEditSurchargeAmount(Math.max(0, Number(e.target.value)))
+                      }
+                      className="w-full px-2.5 py-1.5 text-sm font-mono font-semibold text-slate-900 border border-slate-300 rounded-md bg-white disabled:bg-slate-50 disabled:border-slate-200"
+                    />
+                  </div>
+                  <div className="p-3 rounded-lg border border-slate-200 bg-white">
+                    <label className="text-[11px] text-slate-500 block mb-1">
+                      Descontos (R$)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      disabled={!canEditActiveInvoice}
+                      value={editDiscountAmount}
+                      onChange={(e) =>
+                        setEditDiscountAmount(Math.max(0, Number(e.target.value)))
+                      }
+                      className="w-full px-2.5 py-1.5 text-sm font-mono font-semibold text-slate-900 border border-slate-300 rounded-md bg-white disabled:bg-slate-50 disabled:border-slate-200"
+                    />
+                  </div>
+                  <div
+                    className={`p-3 rounded-lg border border-slate-300 bg-slate-100/80 ${
+                      activeInvoice.docType !== 'NFSE' ? 'col-span-2 sm:col-span-1' : ''
+                    }`}
+                  >
+                    <label className="text-[11px] text-slate-600 font-medium block mb-1">
+                      Valor Líquido da Nota (R$)
+                    </label>
+                    <input
+                      type="text"
+                      readOnly
+                      tabIndex={-1}
+                      aria-readonly="true"
+                      value={formatBRL(editComputedTotal)}
+                      className="w-full px-2.5 py-1.5 text-sm font-mono font-bold text-slate-900 border border-slate-300 rounded-md bg-slate-100 cursor-not-allowed"
+                    />
                   </div>
                 </div>
 
@@ -2720,12 +4470,14 @@ export function FiscalModule() {
                             if (next === 'mei') {
                               setEditPisAmount(0);
                               setEditCofinsAmount(0);
+                              setEditCsllAmount(0);
                               setEditIssqnAmount(0);
                               setEditInssAmount(0);
                               setEditIrrfAmount(0);
                             } else if (next === 'simples_nacional') {
                               setEditPisAmount(0);
                               setEditCofinsAmount(0);
+                              setEditCsllAmount(0);
                               setEditIrrfAmount(0);
                             }
                           }}
@@ -2744,12 +4496,12 @@ export function FiscalModule() {
                         {editTaxRegime === 'mei'
                           ? 'Prestador MEI: nenhuma retenção aplicável; campos mantidos zerados.'
                           : editTaxRegime === 'simples_nacional'
-                          ? 'Simples Nacional: habilita ISSQN e INSS (preenchimento opcional).'
-                          : 'Regime Normal: habilita PIS, COFINS, ISSQN, INSS e IRRF (preenchimento opcional).'}
+                          ? 'Simples Nacional: habilita ISSQN e INSS (deduzidos do líquido quando aplicável).'
+                          : 'Regime Normal: habilita PIS, COFINS, CSLL, ISSQN, INSS e IRRF.'}
                       </p>
                     </div>
 
-                    <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 tabular-nums">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 tabular-nums">
                       <div>
                         <label className="block text-[11px] font-medium text-slate-600 mb-1">
                           PIS (R$)
@@ -2776,6 +4528,22 @@ export function FiscalModule() {
                           value={editTaxRegime === 'regime_normal' ? editCofinsAmount : 0}
                           onChange={(e) =>
                             setEditCofinsAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                          CSLL (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={!canEditActiveInvoice || editTaxRegime !== 'regime_normal'}
+                          value={editTaxRegime === 'regime_normal' ? editCsllAmount : 0}
+                          onChange={(e) =>
+                            setEditCsllAmount(Math.max(0, Number(e.target.value)))
                           }
                           className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
                         />
@@ -2829,46 +4597,123 @@ export function FiscalModule() {
                         />
                       </div>
                     </div>
+
+                    <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        disabled={!canEditActiveInvoice || editTaxRegime === 'mei'}
+                        checked={editIssqnRetained}
+                        onChange={(e) => setEditIssqnRetained(e.target.checked)}
+                        className="rounded border-slate-300"
+                      />
+                      ISSQN Retido na fonte (deduz do valor líquido; desmarque se for apenas ISSQN destacado)
+                    </label>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 tabular-nums">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2.5 tabular-nums">
+                    <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                      <label className="text-[11px] font-medium text-slate-600 block mb-1">
+                        ICMS ST (R$)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={!canEditActiveInvoice || activeInvoice.docType === 'CTE'}
+                        value={activeInvoice.docType === 'CTE' ? 0 : editIcmsStAmount}
+                        onChange={(e) =>
+                          setEditIcmsStAmount(Math.max(0, Number(e.target.value)))
+                        }
+                        className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                      />
+                    </div>
+                    <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                      <label className="text-[11px] font-medium text-slate-600 block mb-1">
+                        IPI (R$)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={!canEditActiveInvoice || activeInvoice.docType === 'CTE'}
+                        value={activeInvoice.docType === 'CTE' ? 0 : editIpiAmount}
+                        onChange={(e) => setEditIpiAmount(Math.max(0, Number(e.target.value)))}
+                        className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                      />
+                    </div>
+                    <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                      <label className="text-[11px] font-medium text-slate-600 block mb-1">
+                        Retidos (R$)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={!canEditActiveInvoice}
+                        value={editRetainedTaxesAmount}
+                        onChange={(e) =>
+                          setEditRetainedTaxesAmount(Math.max(0, Number(e.target.value)))
+                        }
+                        className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                      />
+                    </div>
                     <div
-                      className={`p-3 rounded-lg border ${
-                        Number(activeInvoice.icmsDesonAmount || 0) > 0
+                      className={`p-2.5 rounded-lg border ${
+                        editIcmsDesonAmount > 0
                           ? 'border-amber-200 bg-amber-50/70'
                           : 'border-slate-200 bg-slate-50/60'
                       }`}
                     >
-                      <span className="text-[11px] font-medium text-slate-600 block">
-                        ICMS Desonerado
-                      </span>
-                      <span className="font-mono text-sm font-semibold text-slate-900 mt-0.5 block">
-                        {formatBRL(Number(activeInvoice.icmsDesonAmount || 0))}
-                      </span>
+                      <label className="text-[11px] font-medium text-slate-600 block mb-1">
+                        ICMS Deson.
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={!canEditActiveInvoice}
+                        value={editIcmsDesonAmount}
+                        onChange={(e) =>
+                          setEditIcmsDesonAmount(Math.max(0, Number(e.target.value)))
+                        }
+                        className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                      />
                     </div>
-                    <div className="p-3 rounded-lg border border-slate-200 bg-slate-50/60">
-                      <span className="text-[11px] text-slate-500 block">ICMS</span>
-                      <span className="font-mono text-sm font-medium text-slate-900 mt-0.5 block">
-                        {formatBRL(Number(activeInvoice.icmsAmount || 0))}
-                      </span>
+                    <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                      <label className="text-[11px] text-slate-500 block mb-1">ICMS (R$)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={!canEditActiveInvoice}
+                        value={editIcmsAmount}
+                        onChange={(e) => setEditIcmsAmount(Math.max(0, Number(e.target.value)))}
+                        className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                      />
                     </div>
-                    <div className="p-3 rounded-lg border border-slate-200 bg-slate-50/60">
-                      <span className="text-[11px] text-slate-500 block">IPI</span>
-                      <span className="font-mono text-sm font-medium text-slate-900 mt-0.5 block">
-                        {formatBRL(Number(activeInvoice.ipiAmount || 0))}
-                      </span>
+                    <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                      <label className="text-[11px] text-slate-500 block mb-1">PIS (R$)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={!canEditActiveInvoice}
+                        value={editPisAmount}
+                        onChange={(e) => setEditPisAmount(Math.max(0, Number(e.target.value)))}
+                        className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                      />
                     </div>
-                    <div className="p-3 rounded-lg border border-slate-200 bg-slate-50/60">
-                      <span className="text-[11px] text-slate-500 block">PIS</span>
-                      <span className="font-mono text-sm font-medium text-slate-900 mt-0.5 block">
-                        {formatBRL(Number(activeInvoice.pisAmount || 0))}
-                      </span>
-                    </div>
-                    <div className="p-3 rounded-lg border border-slate-200 bg-slate-50/60">
-                      <span className="text-[11px] text-slate-500 block">COFINS</span>
-                      <span className="font-mono text-sm font-medium text-slate-900 mt-0.5 block">
-                        {formatBRL(Number(activeInvoice.cofinsAmount || 0))}
-                      </span>
+                    <div className="p-2.5 rounded-lg border border-slate-200 bg-slate-50/60">
+                      <label className="text-[11px] text-slate-500 block mb-1">COFINS (R$)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={!canEditActiveInvoice}
+                        value={editCofinsAmount}
+                        onChange={(e) => setEditCofinsAmount(Math.max(0, Number(e.target.value)))}
+                        className="w-full px-2 py-1 text-xs font-mono border border-slate-300 rounded bg-white disabled:bg-slate-100 disabled:text-slate-500"
+                      />
                     </div>
                   </div>
                 )}
@@ -3168,6 +5013,42 @@ export function FiscalModule() {
                   )}
                 </div>
 
+                {/* Controle de Exigência de Recebimento Físico */}
+                <div className="p-3.5 rounded-lg border border-slate-200 bg-slate-50/70 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <span className="text-xs font-semibold text-slate-800 block">
+                      Passará pelo recebimento físico?
+                    </span>
+                    <span className="text-[11px] text-slate-500">
+                      {canToggleActivePhysicalReceipt
+                        ? 'Defina se o documento exige entrada na doca ou segue fluxo direto no Fiscal.'
+                        : Boolean(activeInvoice.receiptId) || Boolean(linkReceiptId)
+                        ? 'Bloqueado pois há um Recebimento Físico vinculado.'
+                        : 'Alteração bloqueada após o lançamento da nota.'}
+                    </span>
+                  </div>
+                  <select
+                    value={requiresReceiptForActive ? 'sim' : 'nao'}
+                    disabled={!canToggleActivePhysicalReceipt}
+                    onChange={(e) => {
+                      const next = e.target.value === 'sim';
+                      setEditRequiresPhysicalReceipt(next);
+                      if (!next) {
+                        setLinkReceiptId('');
+                        if (editFiscalStatus === 'aguardando_recebimento') {
+                          setEditFiscalStatus('pendente');
+                        }
+                      }
+                    }}
+                    className="px-3 py-2 text-xs font-medium border border-slate-300 rounded-lg bg-white disabled:bg-slate-100"
+                  >
+                    <option value="sim">Sim (Exige confirmação física na doca)</option>
+                    <option value="nao">
+                      Não (Fluxo direto no Fiscal — dispensa recebimento)
+                    </option>
+                  </select>
+                </div>
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
@@ -3184,11 +5065,18 @@ export function FiscalModule() {
                             value={linkPoId}
                             disabled={
                               !canEditActiveInvoice ||
-                              (!isAdmin && Boolean(activeInvoice.purchaseOrderId))
+                              (!isAdmin && Boolean(activeInvoice.purchaseOrderId)) ||
+                              Boolean(activeAdjustmentRequest)
                             }
                             onChange={(e) => {
                               const nextPoId = e.target.value;
+                              if (nextPoId !== linkPoId) {
+                                setEditItemAssociations([]);
+                              }
                               setLinkPoId(nextPoId);
+                              if (!nextPoId) {
+                                setEditIsPartialBilling(false);
+                              }
                               if (linkReceiptId) {
                                 const currentRec = physicalReceipts.find(
                                   (r) => r.id === linkReceiptId
@@ -3212,10 +5100,24 @@ export function FiscalModule() {
                             ))}
                           </select>
                           <span className="text-[11px] text-slate-500 mt-1 block">
-                            {!isAdmin && activeInvoice.purchaseOrderId
+                            {activeAdjustmentRequest
+                              ? 'Vínculo gerenciado pela Solicitação de Ajuste com Compras abaixo.'
+                              : !isAdmin && activeInvoice.purchaseOrderId
                               ? 'Desvinculação permitida apenas ao ADM Titular.'
                               : `Filtrado por saldo pendente e CNPJ exato (${activeInvoice.issuerCnpj}).`}
                           </span>
+                          {linkPoId && (
+                            <label className="mt-2 inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                disabled={!canEditActiveInvoice}
+                                checked={editIsPartialBilling}
+                                onChange={(e) => setEditIsPartialBilling(e.target.checked)}
+                                className="rounded border-slate-300"
+                              />
+                              Faturamento / Entrega Parcial (múltiplas notas atendendo este Pedido)
+                            </label>
+                          )}
                         </>
                       );
                     })()}
@@ -3239,6 +5141,7 @@ export function FiscalModule() {
                           value={linkReceiptId}
                           disabled={
                             !canEditActiveInvoice ||
+                            !requiresReceiptForActive ||
                             (!isAdmin && Boolean(activeInvoice.receiptId))
                           }
                           onChange={(e) => {
@@ -3246,6 +5149,7 @@ export function FiscalModule() {
                             setLinkReceiptId(nextRecId);
                             if (
                               !nextRecId &&
+                              requiresReceiptForActive &&
                               (editFiscalStatus === 'lancado' || editFiscalStatus === 'escriturada')
                             ) {
                               setEditFiscalStatus('aguardando_recebimento');
@@ -3255,7 +5159,9 @@ export function FiscalModule() {
                           className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white disabled:bg-slate-100"
                         >
                           <option value="">
-                            {eligibleReceipts.length === 0
+                            {!requiresReceiptForActive
+                              ? 'Dispensado (não passa pelo recebimento físico)'
+                              : eligibleReceipts.length === 0
                               ? 'Nenhum recebimento compatível'
                               : 'Sem vínculo'}
                           </option>
@@ -3270,190 +5176,369 @@ export function FiscalModule() {
                   </div>
                 </div>
 
-                <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-xs font-semibold text-slate-800">
-                      Cruzamento Three-Way Match (Pedido × Doca × Documento Fiscal)
-                    </span>
-                    <StatusTag
-                      label={
-                        modalMatchPreview.status === 'conciliada'
-                          ? 'Conciliada'
-                          : modalMatchPreview.status === 'divergente'
-                          ? 'Divergente'
-                          : 'Pendente Vínculo'
-                      }
-                      tone={
-                        modalMatchPreview.status === 'conciliada'
-                          ? 'success'
-                          : modalMatchPreview.status === 'divergente'
-                          ? 'warning'
-                          : 'neutral'
-                      }
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs pt-1 tabular-nums">
-                    <div className="p-2.5 rounded-md bg-white border border-slate-200">
-                      <span className="text-[11px] text-slate-500 block">
-                        Quantidades (Ped × Doca × NF)
-                      </span>
-                      <span className="font-mono font-medium text-slate-900 mt-0.5 block">
-                        {modalMatchPreview.orderedQtyTotal ?? '—'} ·{' '}
-                        {modalMatchPreview.receivedQtyTotal ?? '—'} ·{' '}
-                        {modalMatchPreview.invoiceQtyTotal}
-                      </span>
-                      {modalMatchPreview.qtyMatch !== null && (
-                        <span
-                          className={`text-[11px] font-medium mt-0.5 block ${
-                            modalMatchPreview.qtyMatch ? 'text-emerald-700' : 'text-amber-700'
-                          }`}
-                        >
-                          {modalMatchPreview.qtyMatch ? 'Quantidades conferem' : 'Divergência de qtd'}
+                {/* Painel da Solicitação de Ajuste com Compras (quando aberta) */}
+                {activeAdjustmentRequest && (
+                  <div className="p-4 rounded-lg bg-amber-50/70 border border-amber-200 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="text-xs font-semibold text-amber-950 block">
+                          Solicitação de Ajuste com Compras · Pedido {activeAdjustmentRequest.poNumber}
                         </span>
-                      )}
+                        <span className="text-[11px] text-amber-800">
+                          Status atual: <span className="font-semibold">{activeAdjustmentRequest.status}</span>
+                        </span>
+                      </div>
+                      <StatusTag
+                        label={activeAdjustmentRequest.status}
+                        tone={
+                          activeAdjustmentRequest.status === 'Ajustado' ||
+                          activeAdjustmentRequest.status === 'Devolvido para revisão fiscal'
+                            ? 'info'
+                            : 'warning'
+                        }
+                      />
                     </div>
 
-                    <div className="p-2.5 rounded-md bg-white border border-slate-200">
-                      <span className="text-[11px] text-slate-500 block">
-                        Valor Bruto (Ped × NF)
-                      </span>
-                      <span className="font-mono font-medium text-slate-900 mt-0.5 block">
-                        {modalMatchPreview.poGrossTotal !== null
-                          ? formatBRL(modalMatchPreview.poGrossTotal)
-                          : '—'}{' '}
-                        · {formatBRL(modalMatchPreview.invoiceGrossTotal)}
-                      </span>
-                      {modalMatchPreview.grossMatch !== null && (
-                        <span className="text-[11px] text-slate-500 mt-0.5 block">
-                          {modalMatchPreview.grossMatch
-                            ? 'Bruto confere'
-                            : 'Diferença informativa (s/ alerta)'}
-                        </span>
-                      )}
-                    </div>
+                    {activeAdjustmentRequest.divergenceReasons.length > 0 && (
+                      <ul className="list-disc pl-4 text-xs text-amber-900 space-y-0.5">
+                        {activeAdjustmentRequest.divergenceReasons.map((r, i) => (
+                          <li key={i}>{r}</li>
+                        ))}
+                      </ul>
+                    )}
 
-                    <div
-                      className={`p-2.5 rounded-md border ${
-                        modalMatchPreview.netMatch === false
-                          ? 'bg-amber-50/70 border-amber-300'
-                          : 'bg-white border-slate-200'
-                      }`}
-                    >
-                      <span className="text-[11px] text-slate-500 block">
-                        Valor Líquido (Ped × NF)
-                      </span>
-                      <span className="font-mono font-semibold text-slate-900 mt-0.5 block">
-                        {modalMatchPreview.poTotal !== null
-                          ? formatBRL(modalMatchPreview.poTotal)
-                          : '—'}{' '}
-                        · {formatBRL(modalMatchPreview.invoiceTotal)}
-                      </span>
-                      {modalMatchPreview.netMatch !== null && (
-                        <span
-                          className={`text-[11px] font-medium mt-0.5 block ${
-                            modalMatchPreview.netMatch ? 'text-emerald-700' : 'text-amber-800'
-                          }`}
-                        >
-                          {modalMatchPreview.netMatch
-                            ? 'Líquido confere'
-                            : 'Líquido diverge do Pedido'}
-                        </span>
-                      )}
-                    </div>
+                    {activeAdjustmentRequest.comprasResponse && (
+                      <div className="p-2.5 rounded bg-white border border-amber-200 text-xs text-slate-800">
+                        <span className="font-semibold text-slate-900">Resposta de Compras: </span>
+                        {activeAdjustmentRequest.comprasResponse}
+                      </div>
+                    )}
 
-                    <div className="p-2.5 rounded-md bg-white border border-slate-200">
-                      <span className="text-[11px] text-slate-500 block">
-                        Valores Unitários
-                      </span>
-                      <span className="font-medium text-slate-900 mt-0.5 block">
-                        {modalMatchPreview.unitPricesMatch === null
-                          ? '—'
-                          : modalMatchPreview.unitPricesMatch
-                          ? 'Todos conferem'
-                          : 'Diferença unitária'}
-                      </span>
-                      {modalMatchPreview.unitPricesMatch !== null && (
-                        <span className="text-[11px] text-slate-500 mt-0.5 block">
-                          {modalMatchPreview.unitPricesMatch
-                            ? 'Unitário Pedido = Nota'
-                            : 'Informativo (não bloqueia)'}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-
-                  {modalMatchPreview.itemComparisons.length > 0 && (
-                    <div className="border border-slate-200 rounded-md bg-white overflow-hidden">
-                      <div className="max-h-40 overflow-y-auto overflow-x-auto">
+                    {adjustmentPreviewMatch?.financialComparison && (
+                      <div className="border border-amber-200 rounded bg-white overflow-hidden">
                         <table className="w-full text-left border-collapse text-[11px]">
                           <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
                             <tr>
-                              <th className="py-1.5 px-2.5 font-medium">Item (Pedido × Nota)</th>
-                              <th className="py-1.5 px-2.5 font-medium text-right">Qtd Ped.</th>
-                              <th className="py-1.5 px-2.5 font-medium text-right">Qtd NF</th>
-                              <th className="py-1.5 px-2.5 font-medium text-right">Unit. Ped.</th>
-                              <th className="py-1.5 px-2.5 font-medium text-right">Unit. NF</th>
-                              <th className="py-1.5 px-2.5 font-medium text-right">Conferência</th>
+                              <th className="py-1.5 px-2.5 font-medium">
+                                Pré-confronto atual após revisão do Pedido {activeAdjustmentRequest.poNumber}
+                              </th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Pedido</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Nota</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Situação</th>
                             </tr>
                           </thead>
-                          <tbody className="divide-y divide-slate-100 tabular-nums">
-                            {modalMatchPreview.itemComparisons.map((cmp, i) => (
-                              <tr key={i}>
-                                <td className="py-1.5 px-2.5 text-slate-800 max-w-[180px] truncate" title={cmp.description}>
-                                  {cmp.description}
-                                </td>
-                                <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
-                                  {cmp.poQty !== null ? cmp.poQty : '—'}
-                                </td>
-                                <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
-                                  {cmp.invoiceQty !== null ? cmp.invoiceQty : '—'}
-                                </td>
-                                <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
-                                  {cmp.poUnitPrice !== null ? formatBRL(cmp.poUnitPrice) : '—'}
-                                </td>
-                                <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
-                                  {cmp.invoiceUnitPrice !== null
-                                    ? formatBRL(cmp.invoiceUnitPrice)
-                                    : '—'}
-                                </td>
-                                <td className="py-1.5 px-2.5 text-right whitespace-nowrap">
-                                  {!cmp.matchedInPo ? (
-                                    <span className="text-amber-700 font-medium">Fora do PO</span>
-                                  ) : !cmp.qtyMatch ? (
-                                    <span className="text-amber-700 font-medium">Qtd diverge</span>
-                                  ) : !cmp.unitPriceMatch ? (
-                                    <span className="text-slate-600">Unit. difere</span>
-                                  ) : (
-                                    <span className="text-emerald-700 font-medium">Confere</span>
-                                  )}
-                                </td>
-                              </tr>
-                            ))}
+                          <tbody className="tabular-nums">
+                            <tr>
+                              <td className="py-1.5 px-2.5 text-slate-800">
+                                {adjustmentPreviewMatch.financialComparison.criterionLabel}
+                              </td>
+                              <td className="py-1.5 px-2.5 text-right font-mono">
+                                {formatBRL(adjustmentPreviewMatch.financialComparison.poComparedAmount)}
+                              </td>
+                              <td className="py-1.5 px-2.5 text-right font-mono">
+                                {formatBRL(adjustmentPreviewMatch.financialComparison.invoiceComparedAmount)}
+                              </td>
+                              <td className="py-1.5 px-2.5 text-right font-semibold">
+                                {adjustmentPreviewMatch.financialComparison.matches ? (
+                                  <span className="text-emerald-700">Confere</span>
+                                ) : (
+                                  <span className="text-amber-700">
+                                    Diverge ({formatBRL(adjustmentPreviewMatch.financialComparison.differenceAmount)})
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
                           </tbody>
                         </table>
                       </div>
+                    )}
+
+                    {canEditActiveInvoice && (
+                      <div className="space-y-2 pt-1">
+                        <input
+                          type="text"
+                          value={fiscalResolutionNote}
+                          onChange={(e) => setFiscalResolutionNote(e.target.value)}
+                          placeholder="Observação fiscal para resolver, reabrir (obrigatório ao reabrir) ou cancelar..."
+                          className="w-full px-2.5 py-1.5 text-xs border border-amber-300 rounded bg-white"
+                        />
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            disabled={saving}
+                            onClick={() => void handleResolveOrUpdateActiveAdjustment('Resolvido')}
+                            className="px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 hover:bg-emerald-800 rounded-lg cursor-pointer disabled:opacity-50"
+                          >
+                            Resolver e Vincular Pedido {activeAdjustmentRequest.poNumber}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={saving}
+                            onClick={() => void handleResolveOrUpdateActiveAdjustment('Reaberto')}
+                            className="px-3 py-1.5 text-xs font-medium text-amber-900 bg-white border border-amber-300 hover:bg-amber-100 rounded-lg cursor-pointer disabled:opacity-50"
+                          >
+                            Devolver / Reabrir p/ Compras
+                          </button>
+                          <button
+                            type="button"
+                            disabled={saving}
+                            onClick={() => void handleResolveOrUpdateActiveAdjustment('Cancelado')}
+                            className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 rounded-lg cursor-pointer disabled:opacity-50"
+                          >
+                            Cancelar Solicitação
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {(() => {
+                  const selectedFichaPo = purchaseOrders.find((p) => p.id === linkPoId);
+                  return (
+                    <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-800">
+                          {requiresReceiptForActive
+                            ? 'Cruzamento Three-Way Match (Pedido × Doca × Documento Fiscal)'
+                            : 'Cruzamento Two-Way Match (Pedido × Documento Fiscal · Dispensa Recebimento)'}
+                        </span>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {activeInvoice.conferenceStatus === 'conferido' && !isConferenceStale && (
+                            <StatusTag label="Conferido" tone="success" />
+                          )}
+                          <StatusTag
+                            label={
+                              activeAdjustmentRequest
+                                ? 'Aguardando ajuste de Compras'
+                                : modalMatchPreview.conferenceBadgeState === 'sem_divergencia'
+                                ? 'Sem divergência'
+                                : modalMatchPreview.conferenceBadgeState === 'divergente'
+                                ? 'Divergente'
+                                : modalMatchPreview.conferenceBadgeState === 'aguardando_conciliacao'
+                                ? 'Aguardando Conciliação'
+                                : 'Aguardando Vinculação'
+                            }
+                            tone={
+                              activeAdjustmentRequest
+                                ? 'warning'
+                                : modalMatchPreview.conferenceBadgeState === 'sem_divergencia'
+                                ? 'success'
+                                : modalMatchPreview.conferenceBadgeState === 'divergente'
+                                ? 'warning'
+                                : modalMatchPreview.conferenceBadgeState === 'aguardando_conciliacao'
+                                ? 'info'
+                                : 'neutral'
+                            }
+                          />
+                        </div>
+                      </div>
+
+                      {isConferenceStale && (
+                        <div className="p-2.5 rounded bg-amber-50 border border-amber-200 text-[11px] text-amber-900">
+                          Os dados do Pedido, da Nota ou das associações mudaram após a última conferência. Reconfirme abaixo após revisar.
+                        </div>
+                      )}
+
+                      {selectedFichaPo && (
+                        <ItemReconciliationEditor
+                          supplierCnpj={activeInvoice.issuerCnpj}
+                          invoiceItems={activeInvoice.items}
+                          poItems={selectedFichaPo.items}
+                          associations={modalMatchPreview.associations}
+                          suggestions={modalMatchPreview.suggestions}
+                          unmatchedInvoiceItemIndexes={modalMatchPreview.unmatchedInvoiceItemIndexes}
+                          unmatchedPoItemIndexes={modalMatchPreview.unmatchedPoItemIndexes}
+                          canEdit={canEditActiveInvoice && !activeAdjustmentRequest}
+                          onChangeAssociations={setEditItemAssociations}
+                          onSaveEquivalence={async (eq) => {
+                            await upsertProductEquivalence(eq);
+                          }}
+                        />
+                      )}
+
+                      {modalMatchPreview.itemComparisons.length > 0 && (
+                        <div className="border border-slate-200 rounded-md bg-white overflow-hidden">
+                          <div className="max-h-40 overflow-y-auto overflow-x-auto">
+                            <table className="w-full text-left border-collapse text-[11px]">
+                              <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                                <tr>
+                                  <th className="py-1.5 px-2.5 font-medium">Item (Pedido × Nota)</th>
+                                  <th className="py-1.5 px-2.5 font-medium text-right">Qtd Ped.</th>
+                                  <th className="py-1.5 px-2.5 font-medium text-right">Qtd NF</th>
+                                  <th className="py-1.5 px-2.5 font-medium text-right">Unit. Ped.</th>
+                                  <th className="py-1.5 px-2.5 font-medium text-right">Unit. NF</th>
+                                  <th className="py-1.5 px-2.5 font-medium text-right">Conferência</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100 tabular-nums">
+                                {modalMatchPreview.itemComparisons.map((cmp, i) => (
+                                  <tr key={i}>
+                                    <td className="py-1.5 px-2.5 text-slate-800 max-w-[180px] truncate" title={cmp.description}>
+                                      {cmp.description}
+                                    </td>
+                                    <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
+                                      {cmp.poQty !== null ? cmp.poQty : '—'}
+                                    </td>
+                                    <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
+                                      {cmp.invoiceQty !== null ? cmp.invoiceQty : '—'}
+                                    </td>
+                                    <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
+                                      {cmp.poUnitPrice !== null ? formatBRL(cmp.poUnitPrice) : '—'}
+                                    </td>
+                                    <td className="py-1.5 px-2.5 text-right font-mono text-slate-700">
+                                      {cmp.invoiceUnitPrice !== null
+                                        ? formatBRL(cmp.invoiceUnitPrice)
+                                        : '—'}
+                                    </td>
+                                    <td className="py-1.5 px-2.5 text-right whitespace-nowrap">
+                                      {!cmp.matchedInPo ? (
+                                        <span className="text-amber-700 font-medium">Fora do PO</span>
+                                      ) : !cmp.qtyMatch ? (
+                                        <span className="text-amber-700 font-medium">Qtd diverge</span>
+                                      ) : !cmp.unitPriceMatch ? (
+                                        <span className="text-slate-600">Unit. difere</span>
+                                      ) : (
+                                        <span className="text-emerald-700 font-medium">Confere</span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
+                      {modalMatchPreview.financialComparison && (
+                        <div className="border border-slate-200 rounded-md bg-white overflow-hidden">
+                          <table className="w-full text-left border-collapse text-[11px]">
+                            <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                              <tr>
+                                <th className="py-1.5 px-2.5 font-medium">Confronto de Valores</th>
+                                <th className="py-1.5 px-2.5 font-medium text-right">
+                                  Pedido de Compra
+                                </th>
+                                <th className="py-1.5 px-2.5 font-medium text-right">Nota Fiscal</th>
+                                <th className="py-1.5 px-2.5 font-medium text-right">Situação</th>
+                              </tr>
+                            </thead>
+                            <tbody className="tabular-nums">
+                              <tr>
+                                <td className="py-2 px-2.5 font-medium text-slate-800">
+                                  {modalMatchPreview.financialComparison.criterionLabel}
+                                  {modalMatchPreview.isPartialBilling && (
+                                    <span className="text-blue-700 ml-1.5">(Parcela)</span>
+                                  )}
+                                </td>
+                                <td className="py-2 px-2.5 text-right font-mono text-slate-900">
+                                  {formatBRL(modalMatchPreview.financialComparison.poComparedAmount)}
+                                </td>
+                                <td className="py-2 px-2.5 text-right font-mono text-slate-900">
+                                  {formatBRL(modalMatchPreview.financialComparison.invoiceComparedAmount)}
+                                </td>
+                                <td className="py-2 px-2.5 text-right whitespace-nowrap">
+                                  {modalMatchPreview.financialComparison.matches ? (
+                                    <span className="text-emerald-700 font-semibold">Confere</span>
+                                  ) : (
+                                    <span className="text-amber-700 font-semibold">
+                                      Diverge ({formatBRL(modalMatchPreview.financialComparison.differenceAmount)})
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+
+                      {modalMatchPreview.reasons.length > 0 && (
+                        <ul className="list-disc pl-4 text-xs text-amber-800 pt-1 space-y-0.5">
+                          {modalMatchPreview.reasons.map((r, i) => (
+                            <li key={i}>{r}</li>
+                          ))}
+                        </ul>
+                      )}
+
+                      {canEditActiveInvoice && linkPoId && !activeAdjustmentRequest && (
+                        <div className="pt-3 border-t border-slate-200 space-y-2.5">
+                          {modalMatchPreview.conferenceBadgeState === 'divergente' && (
+                            <div>
+                              <label className="block text-[11px] font-medium text-slate-700 mb-1">
+                                Justificativa para confirmar conferência divergente (obrigatória ao confirmar)
+                              </label>
+                              <input
+                                type="text"
+                                value={confJustificationInput}
+                                onChange={(e) => setConfJustificationInput(e.target.value)}
+                                placeholder="Explique por que aceita a divergência..."
+                                className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded bg-white"
+                              />
+                            </div>
+                          )}
+
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <button
+                              type="button"
+                              disabled={
+                                saving ||
+                                modalMatchPreview.unmatchedInvoiceItemIndexes.length > 0
+                              }
+                              onClick={() => void handleConfirmActiveConference()}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 hover:bg-slate-800 rounded-lg disabled:opacity-50 cursor-pointer"
+                            >
+                              <BookmarkCheck className="w-3.5 h-3.5" />
+                              Confirmar Conferência
+                            </button>
+
+                            {(modalMatchPreview.conferenceBadgeState === 'divergente' ||
+                              modalMatchPreview.unmatchedInvoiceItemIndexes.length > 0) && (
+                              <div className="flex flex-wrap items-center gap-2 flex-1 justify-end">
+                                <input
+                                  type="text"
+                                  value={adjObservationInput}
+                                  onChange={(e) => setAdjObservationInput(e.target.value)}
+                                  placeholder="Observação para Compras (opcional)"
+                                  className="min-w-[200px] flex-1 max-w-xs px-2.5 py-1.5 text-xs border border-amber-300 rounded bg-white"
+                                />
+                                <button
+                                  type="button"
+                                  disabled={saving}
+                                  onClick={() => void handleCreateActiveAdjustment()}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-950 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded-lg cursor-pointer disabled:opacity-50"
+                                >
+                                  <MessageSquareWarning className="w-3.5 h-3.5 text-amber-800" />
+                                  Notificar Compras
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
-                  )}
+                  );
+                })()}
 
-                  {modalMatchPreview.reasons.length > 0 && (
-                    <ul className="list-disc pl-4 text-xs text-amber-800 pt-1 space-y-0.5">
-                      {modalMatchPreview.reasons.map((r, i) => (
-                        <li key={i}>{r}</li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-
-                {!hasSignaledReceipt && (
+                {!canLaunchActive ? (
                   <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 flex items-start gap-2.5 text-xs text-amber-900">
                     <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
                     <span>
-                      <span className="font-semibold">Lançamento bloqueado:</span> a nota fiscal só pode ser liberada para o status{' '}
-                      <span className="font-semibold">Lançado</span> após o setor de Recebimento sinalizar a entrada física.
+                      <span className="font-semibold">Lançamento bloqueado:</span>{' '}
+                      {!hasLinkedPo && requiresReceiptForActive && !hasSignaledReceipt
+                        ? 'vincule um Pedido de Compra e aguarde a sinalização do recebimento físico pelo setor de Recebimento.'
+                        : !hasLinkedPo
+                        ? 'é obrigatório vincular um Pedido de Compra antes de lançar a nota fiscal.'
+                        : 'esta nota foi cadastrada para fluxo com conferência física e exige a sinalização do Recebimento antes do lançamento.'}
                     </span>
                   </div>
-                )}
+                ) : !requiresReceiptForActive ? (
+                  <div className="p-3 rounded-lg bg-blue-50 border border-blue-200 flex items-start gap-2.5 text-xs text-blue-900">
+                    <CheckCircle2 className="w-4 h-4 text-blue-700 shrink-0 mt-0.5" />
+                    <span>
+                      <span className="font-semibold">Fluxo direto do Fiscal:</span> Pedido de Compra vinculado. Esta nota dispensa confirmação de recebimento físico na doca para ser lançada.
+                    </span>
+                  </div>
+                ) : null}
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
@@ -3479,10 +5564,21 @@ export function FiscalModule() {
                       }}
                       className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white disabled:bg-slate-100"
                     >
-                      <option value="aguardando_recebimento">Aguardando Recebimento</option>
+                      <option
+                        value="aguardando_recebimento"
+                        disabled={!requiresReceiptForActive}
+                      >
+                        Aguardando Recebimento
+                        {!requiresReceiptForActive ? ' (Não aplicável a fluxo direto)' : ''}
+                      </option>
                       <option value="pendente">Pendente</option>
-                      <option value="lancado" disabled={!hasSignaledReceipt}>
-                        Lançado{!hasSignaledReceipt ? ' (Requer recebimento físico)' : ''}
+                      <option value="lancado" disabled={!canLaunchActive}>
+                        Lançado
+                        {!canLaunchActive
+                          ? requiresReceiptForActive
+                            ? ' (Requer Pedido e Recebimento físico)'
+                            : ' (Requer Pedido de Compra)'
+                          : ''}
                       </option>
                       <option value="substituida">Substituída</option>
                       <option value="rejeitada">Rejeitada</option>
@@ -3736,7 +5832,7 @@ export function FiscalModule() {
                         ? 'MEI selecionado: nenhum imposto é retido e os tributos de serviço ficam zerados.'
                         : manualTaxRegime === 'simples_nacional'
                         ? 'Simples Nacional selecionado: campos ISSQN e INSS liberados abaixo (preenchimento opcional).'
-                        : 'Regime Normal selecionado: campos PIS, COFINS, ISSQN, INSS e IRRF liberados abaixo (preenchimento opcional).'}
+                        : 'Regime Normal selecionado: campos PIS, COFINS, CSLL, ISSQN, INSS e IRRF liberados abaixo (preenchimento opcional).'}
                     </p>
                   </div>
                 )}
@@ -3808,37 +5904,62 @@ export function FiscalModule() {
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
-                      Pedido de Compra Vinculado (Opcional)
+                      Passará pelo recebimento físico?
                     </label>
-                    <div className="flex items-center gap-2">
-                      <select
-                        value={manualPoId}
-                        onChange={(e) => handleManualSelectPo(e.target.value)}
-                        className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
-                      >
-                        <option value="">
-                          {manualEligiblePurchaseOrders.length === 0
-                            ? 'Nenhum pedido pendente compatível'
-                            : 'Sem vínculo agora'}
-                        </option>
-                        {manualEligiblePurchaseOrders.map(({ po, remainingQty }) => (
-                          <option key={po.id} value={po.id}>
-                            {po.poNumber} · {po.supplierName} (Saldo: {remainingQty} un)
-                          </option>
-                        ))}
-                      </select>
-                      {manualPoId && (
-                        <button
-                          type="button"
-                          onClick={handleImportItemsFromManualPo}
-                          title="Copiar itens do Pedido de Compra selecionado"
-                          className="px-3 py-2 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg whitespace-nowrap shrink-0 cursor-pointer"
-                        >
-                          Puxar Itens
-                        </button>
-                      )}
-                    </div>
+                    <select
+                      value={manualRequiresPhysicalReceipt ? 'sim' : 'nao'}
+                      onChange={(e) => setManualRequiresPhysicalReceipt(e.target.value === 'sim')}
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+                    >
+                      <option value="sim">Sim (Exige confirmação física na doca)</option>
+                      <option value="nao">Não (Fluxo direto no Fiscal — dispensa recebimento)</option>
+                    </select>
                   </div>
+                </div>
+
+                <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2.5">
+                  <label className="block text-xs font-medium text-slate-700">
+                    Pedido de Compra Vinculado (Opcional)
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={manualPoId}
+                      onChange={(e) => handleManualSelectPo(e.target.value)}
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
+                    >
+                      <option value="">
+                        {manualEligiblePurchaseOrders.length === 0
+                          ? 'Nenhum pedido pendente compatível'
+                          : 'Sem vínculo agora'}
+                      </option>
+                      {manualEligiblePurchaseOrders.map(({ po, remainingQty }) => (
+                        <option key={po.id} value={po.id}>
+                          {po.poNumber} · {po.supplierName} (Saldo: {remainingQty} un)
+                        </option>
+                      ))}
+                    </select>
+                    {manualPoId && (
+                      <button
+                        type="button"
+                        onClick={handleImportItemsFromManualPo}
+                        title="Copiar itens do Pedido de Compra selecionado"
+                        className="px-3 py-2 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-lg whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        Puxar Itens
+                      </button>
+                    )}
+                  </div>
+                  {manualPoId && (
+                    <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={manualIsPartialBilling}
+                        onChange={(e) => setManualIsPartialBilling(e.target.checked)}
+                        className="rounded border-slate-300"
+                      />
+                      Faturamento / Entrega Parcial (múltiplas notas para este Pedido)
+                    </label>
+                  )}
                 </div>
 
                 {manualDocType === 'NFE' && (
@@ -4173,12 +6294,12 @@ export function FiscalModule() {
               {/* 3. Valores, Tributos & Informações Complementares */}
               <div className="space-y-4 pt-4 border-t border-slate-200">
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                  3. Valores, Tributos & Status Inicial
+                  3. Valores, Tributos & Informações Complementares
                 </h3>
 
                 <div
                   className={`grid grid-cols-2 ${
-                    manualDocType === 'NFSE' ? 'sm:grid-cols-3' : 'sm:grid-cols-4'
+                    manualDocType === 'NFSE' ? 'sm:grid-cols-3 lg:grid-cols-5' : 'sm:grid-cols-4'
                   } gap-3`}
                 >
                   <div>
@@ -4192,22 +6313,69 @@ export function FiscalModule() {
                     </div>
                   </div>
                   {manualDocType !== 'NFSE' && (
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        Valor do Frete (R$)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        step="0.01"
-                        value={manualFreightAmount}
-                        onChange={(e) =>
-                          setManualFreightAmount(Math.max(0, Number(e.target.value)))
-                        }
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
-                      />
-                    </div>
+                    <>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          Valor do Frete (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          value={manualFreightAmount}
+                          onChange={(e) =>
+                            setManualFreightAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          Seguro (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          value={manualInsuranceAmount}
+                          onChange={(e) =>
+                            setManualInsuranceAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
+                        />
+                      </div>
+                    </>
                   )}
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Outras Despesas (R$)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={manualOtherExpensesAmount}
+                      onChange={(e) =>
+                        setManualOtherExpensesAmount(Math.max(0, Number(e.target.value)))
+                      }
+                      className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Acréscimos (R$)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={manualSurchargeAmount}
+                      onChange={(e) =>
+                        setManualSurchargeAmount(Math.max(0, Number(e.target.value)))
+                      }
+                      className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
+                    />
+                  </div>
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
                       Descontos (R$)
@@ -4221,110 +6389,185 @@ export function FiscalModule() {
                       className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
                     />
                   </div>
-                  <div>
+                  <div className={manualDocType !== 'NFSE' ? 'col-span-2 sm:col-span-1' : ''}>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
-                      Total da Nota (R$)
+                      Valor Líquido da Nota (R$)
                     </label>
                     <input
-                      type="number"
-                      min={0}
-                      step="0.01"
-                      value={manualTotalOverride}
-                      onChange={(e) => setManualTotalOverride(e.target.value)}
-                      placeholder={manualComputedTotal.toFixed(2)}
-                      className="w-full px-3 py-2 text-sm font-mono font-semibold tabular-nums border border-slate-300 rounded-lg bg-slate-50/50"
+                      type="text"
+                      readOnly
+                      tabIndex={-1}
+                      aria-readonly="true"
+                      value={formatBRL(manualComputedTotal)}
+                      className="w-full px-3 py-2 text-sm font-mono font-bold tabular-nums border border-slate-300 rounded-lg bg-slate-100 text-slate-900 cursor-not-allowed"
                     />
+                    <span className="text-[11px] text-slate-500 mt-1 block">
+                      Calculado automaticamente (somente leitura)
+                    </span>
                   </div>
                 </div>
 
                 {manualDocType === 'NFSE' ? (
-                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        PIS (R$)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        step="0.01"
-                        disabled={manualTaxRegime !== 'regime_normal'}
-                        value={manualTaxRegime === 'regime_normal' ? manualPisAmount : 0}
-                        onChange={(e) =>
-                          setManualPisAmount(Math.max(0, Number(e.target.value)))
-                        }
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
-                      />
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          PIS (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={manualTaxRegime !== 'regime_normal'}
+                          value={manualTaxRegime === 'regime_normal' ? manualPisAmount : 0}
+                          onChange={(e) =>
+                            setManualPisAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          COFINS (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={manualTaxRegime !== 'regime_normal'}
+                          value={manualTaxRegime === 'regime_normal' ? manualCofinsAmount : 0}
+                          onChange={(e) =>
+                            setManualCofinsAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          CSLL (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={manualTaxRegime !== 'regime_normal'}
+                          value={manualTaxRegime === 'regime_normal' ? manualCsllAmount : 0}
+                          onChange={(e) =>
+                            setManualCsllAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          ISSQN (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={manualTaxRegime === 'mei'}
+                          value={manualTaxRegime === 'mei' ? 0 : manualIssqnAmount}
+                          onChange={(e) =>
+                            setManualIssqnAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          INSS (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={manualTaxRegime === 'mei'}
+                          value={manualTaxRegime === 'mei' ? 0 : manualInssAmount}
+                          onChange={(e) =>
+                            setManualInssAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-slate-700 mb-1">
+                          IRRF (R$)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          step="0.01"
+                          disabled={manualTaxRegime !== 'regime_normal'}
+                          value={manualTaxRegime === 'regime_normal' ? manualIrrfAmount : 0}
+                          onChange={(e) =>
+                            setManualIrrfAmount(Math.max(0, Number(e.target.value)))
+                          }
+                          className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        />
+                      </div>
                     </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        COFINS (R$)
-                      </label>
+                    <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
                       <input
-                        type="number"
-                        min={0}
-                        step="0.01"
-                        disabled={manualTaxRegime !== 'regime_normal'}
-                        value={manualTaxRegime === 'regime_normal' ? manualCofinsAmount : 0}
-                        onChange={(e) =>
-                          setManualCofinsAmount(Math.max(0, Number(e.target.value)))
-                        }
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        ISSQN (R$)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        step="0.01"
+                        type="checkbox"
                         disabled={manualTaxRegime === 'mei'}
-                        value={manualTaxRegime === 'mei' ? 0 : manualIssqnAmount}
-                        onChange={(e) =>
-                          setManualIssqnAmount(Math.max(0, Number(e.target.value)))
-                        }
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                        checked={manualIssqnRetained}
+                        onChange={(e) => setManualIssqnRetained(e.target.checked)}
+                        className="rounded border-slate-300"
                       />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        INSS (R$)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        step="0.01"
-                        disabled={manualTaxRegime === 'mei'}
-                        value={manualTaxRegime === 'mei' ? 0 : manualInssAmount}
-                        onChange={(e) =>
-                          setManualInssAmount(Math.max(0, Number(e.target.value)))
-                        }
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        IRRF (R$)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        step="0.01"
-                        disabled={manualTaxRegime !== 'regime_normal'}
-                        value={manualTaxRegime === 'regime_normal' ? manualIrrfAmount : 0}
-                        onChange={(e) =>
-                          setManualIrrfAmount(Math.max(0, Number(e.target.value)))
-                        }
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
-                      />
-                    </div>
+                      ISSQN Retido na fonte (deduz do valor líquido; desmarque se for apenas ISSQN destacado)
+                    </label>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
                     <div>
                       <label className="block text-xs font-medium text-slate-700 mb-1">
-                        ICMS Desonerado (R$)
+                        ICMS ST (R$)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={manualDocType === 'CTE'}
+                        value={manualDocType === 'CTE' ? 0 : manualIcmsStAmount}
+                        onChange={(e) =>
+                          setManualIcmsStAmount(Math.max(0, Number(e.target.value)))
+                        }
+                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                        IPI (R$)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        disabled={manualDocType === 'CTE'}
+                        value={manualDocType === 'CTE' ? 0 : manualIpiAmount}
+                        onChange={(e) => setManualIpiAmount(Math.max(0, Number(e.target.value)))}
+                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg bg-white disabled:bg-slate-100 disabled:text-slate-400"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                        Retidos (R$)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={manualRetainedTaxesAmount}
+                        onChange={(e) =>
+                          setManualRetainedTaxesAmount(Math.max(0, Number(e.target.value)))
+                        }
+                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-slate-700 mb-1">
+                        ICMS Desonerado
                       </label>
                       <input
                         type="number"
@@ -4347,19 +6590,6 @@ export function FiscalModule() {
                         step="0.01"
                         value={manualIcmsAmount}
                         onChange={(e) => setManualIcmsAmount(Math.max(0, Number(e.target.value)))}
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        IPI (R$)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        step="0.01"
-                        value={manualIpiAmount}
-                        onChange={(e) => setManualIpiAmount(Math.max(0, Number(e.target.value)))}
                         className="w-full px-3 py-2 text-sm font-mono tabular-nums border border-slate-300 rounded-lg"
                       />
                     </div>
@@ -4392,6 +6622,105 @@ export function FiscalModule() {
                   </div>
                 )}
 
+                {manualPoId && manualMatchPreview && (
+                  <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-slate-800">
+                        Pré-Conferência com o Pedido Selecionado
+                      </span>
+                      <StatusTag
+                        label={
+                          manualMatchPreview.conferenceBadgeState === 'sem_divergencia'
+                            ? 'Sem divergência'
+                            : manualMatchPreview.conferenceBadgeState === 'aguardando_conciliacao'
+                            ? 'Aguardando Conciliação'
+                            : 'Divergente'
+                        }
+                        tone={
+                          manualMatchPreview.conferenceBadgeState === 'sem_divergencia'
+                            ? 'success'
+                            : manualMatchPreview.conferenceBadgeState === 'aguardando_conciliacao'
+                            ? 'info'
+                            : 'warning'
+                        }
+                      />
+                    </div>
+
+                    {manualMatchPreview.financialComparison && (
+                      <div className="border border-slate-200 rounded bg-white overflow-hidden">
+                        <table className="w-full text-left border-collapse text-[11px]">
+                          <thead className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                            <tr>
+                              <th className="py-1.5 px-2.5 font-medium">Confronto de Valores</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Pedido</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Nota</th>
+                              <th className="py-1.5 px-2.5 font-medium text-right">Situação</th>
+                            </tr>
+                          </thead>
+                          <tbody className="tabular-nums">
+                            <tr>
+                              <td className="py-1.5 px-2.5 text-slate-800 font-medium">
+                                {manualMatchPreview.financialComparison.criterionLabel}
+                              </td>
+                              <td className="py-1.5 px-2.5 text-right font-mono">
+                                {formatBRL(manualMatchPreview.financialComparison.poComparedAmount)}
+                              </td>
+                              <td className="py-1.5 px-2.5 text-right font-mono">
+                                {formatBRL(
+                                  manualMatchPreview.financialComparison.invoiceComparedAmount
+                                )}
+                              </td>
+                              <td className="py-1.5 px-2.5 text-right font-semibold">
+                                {manualMatchPreview.financialComparison.matches ? (
+                                  <span className="text-emerald-700">Confere</span>
+                                ) : (
+                                  <span className="text-amber-700">
+                                    Diverge (
+                                    {formatBRL(
+                                      manualMatchPreview.financialComparison.differenceAmount
+                                    )}
+                                    )
+                                  </span>
+                                )}
+                              </td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+
+                    {manualMatchPreview.reasons.length > 0 && (
+                      <ul className="list-disc pl-4 text-xs text-amber-800 space-y-0.5">
+                        {manualMatchPreview.reasons.map((r, i) => (
+                          <li key={i}>{r}</li>
+                        ))}
+                      </ul>
+                    )}
+
+                    <div className="pt-1 space-y-2">
+                      <label className="inline-flex items-center gap-2 text-xs font-medium text-amber-900 bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-lg cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={manualNotifyCompras}
+                          onChange={(e) => setManualNotifyCompras(e.target.checked)}
+                          className="rounded border-amber-400"
+                        />
+                        <MessageSquareWarning className="w-3.5 h-3.5 text-amber-700" />
+                        Notificar Compras e cadastrar nota sem vínculo definitivo
+                      </label>
+                      {manualNotifyCompras && (
+                        <input
+                          type="text"
+                          value={manualAdjObservation}
+                          onChange={(e) => setManualAdjObservation(e.target.value)}
+                          placeholder="Explique o ajuste necessário ao setor de Compras..."
+                          className="w-full px-2.5 py-1.5 text-xs border border-amber-300 rounded bg-white"
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div>
                     <label className="block text-xs font-medium text-slate-700 mb-1">
@@ -4407,41 +6736,18 @@ export function FiscalModule() {
                     />
                   </div>
 
-                  <div className="space-y-3">
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        Status Inicial no Fluxo P2P
-                      </label>
-                      <select
-                        value={manualFiscalStatus}
-                        onChange={(e) =>
-                          setManualFiscalStatus(
-                            e.target.value as 'aguardando_recebimento' | 'pendente'
-                          )
-                        }
-                        className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg bg-white"
-                      >
-                        <option value="aguardando_recebimento">
-                          Aguardando Recebimento (libera para conferência na doca)
-                        </option>
-                        <option value="pendente">
-                          Pendente (disponível direto na fila do Fiscal)
-                        </option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 mb-1">
-                        Observações Internas do Fiscal
-                      </label>
-                      <input
-                        type="text"
-                        maxLength={BLUEPRINT_LIMITS.MAX_NOTES}
-                        value={manualNotes}
-                        onChange={(e) => setManualNotes(e.target.value)}
-                        placeholder="Anotação interna opcional"
-                        className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
-                      />
-                    </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700 mb-1">
+                      Observações Internas do Fiscal
+                    </label>
+                    <textarea
+                      rows={3}
+                      maxLength={BLUEPRINT_LIMITS.MAX_NOTES}
+                      value={manualNotes}
+                      onChange={(e) => setManualNotes(e.target.value)}
+                      placeholder="Anotação interna opcional"
+                      className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg"
+                    />
                   </div>
                 </div>
               </div>
@@ -4901,6 +7207,11 @@ export function FiscalModule() {
           setDeleteTarget(null);
         }}
         onConfirm={confirmDelete}
+      />
+
+      <FiscalEquivalencesModal
+        open={equivalencesModalOpen}
+        onClose={() => setEquivalencesModalOpen(false)}
       />
       </div>
 
